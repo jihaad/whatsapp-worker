@@ -102,6 +102,11 @@ export class DatabaseAuth extends LocalAuth {
       } finally {
         await rm(tmpTar, { force: true });
       }
+
+      // Remove Chromium profile lock files left by the previous container.
+      for (const lock of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+        await rm(join(sessionDir, lock), { force: true });
+      }
     } catch (e) {
       console.error(`[DatabaseAuth] restore failed for ${this.schoolId}:`, e);
     }
