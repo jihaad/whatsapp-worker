@@ -176,7 +176,6 @@ export async function restoreSessions(): Promise<void> {
 
   try {
     const saved = await prisma.whatsAppSession.findMany({
-      where: { school: { user: { deletedAt: null } } },
       select: { schoolId: true },
     });
     for (const row of saved) ids.add(row.schoolId);
