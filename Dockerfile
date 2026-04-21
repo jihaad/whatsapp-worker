@@ -16,4 +16,4 @@ RUN npm install
 COPY . .
 RUN npm run generate
 
-CMD ["npm", "start"]
+CMD ["sh", "-c", "npm run generate && npm start"]
