@@ -127,21 +127,20 @@ export class DatabaseAuth extends LocalAuth {
       await create({ gzip: true, file: tmpTar, cwd: snapshotRoot }, [sessionDirName]);
       const blob = await readFile(tmpTar);
 
-      await prisma.$transaction([
-        prisma.whatsAppSession.upsert({
-          where: { schoolId: this.schoolId },
-          create: { schoolId: this.schoolId, sessionData: blob, phoneNumber: phoneNumber ?? null },
-          update: { sessionData: blob, ...(phoneNumber ? { phoneNumber } : {}) },
-        }),
-        prisma.school.update({
-          where: { id: this.schoolId },
-          data: {
-            whatsappLinked: true,
-            whatsappLastActivity: new Date(),
-            ...(phoneNumber ? { whatsappPhone: phoneNumber } : {}),
-          },
-        }),
-      ]);
+      await prisma.whatsAppSession.upsert({
+        where: { schoolId: this.schoolId },
+        create: { schoolId: this.schoolId, sessionData: blob, phoneNumber: phoneNumber ?? null },
+        update: { sessionData: blob, ...(phoneNumber ? { phoneNumber } : {}) },
+      });
+      await prisma.school.update({
+        where: { id: this.schoolId },
+        data: {
+          whatsappLinked: true,
+          whatsappLastActivity: new Date(),
+          ...(phoneNumber ? { whatsappPhone: phoneNumber } : {}),
+        },
+      });
+      console.log(`[DatabaseAuth] session persisted for ${this.schoolId}`);
     } finally {
       await rm(tmpTar, { force: true });
       await rmrf(snapshotRoot);
