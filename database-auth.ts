@@ -115,6 +115,7 @@ export class DatabaseAuth extends LocalAuth {
   async persistToDatabase(phoneNumber?: string): Promise<void> {
     const sessionDirName = `session-${this.schoolId}`;
     const sessionDir = join(this.resolvedDataPath, sessionDirName);
+    console.log(`[DatabaseAuth] persist check: sessionDir=${sessionDir} exists=${existsSync(sessionDir)}`);
     if (!existsSync(sessionDir)) return;
 
     const snapshotRoot = join(this.resolvedDataPath, `.snapshot-${this.schoolId}`);
