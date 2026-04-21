@@ -1,3 +1,14 @@
+process.on('uncaughtException', (err) => {
+  console.error('[worker] uncaughtException:', err);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[worker] unhandledRejection:', reason);
+  process.exit(1);
+});
+
+console.log('[worker] Starting up…');
+
 import express from 'express';
 import { initSession, getSession, destroySession, sendMessage, restoreSessions } from './sessions';
 
