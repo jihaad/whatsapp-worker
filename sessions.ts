@@ -90,7 +90,11 @@ export async function initSession(schoolId: string): Promise<SchoolSession> {
   const auth = new DatabaseAuth({ clientId: schoolId, dataPath: getSessionDir() });
   const client = new Client({
     authStrategy: auth,
-    puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] },
+    puppeteer: {
+      headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    },
   });
 
   const managed: ManagedSession = {
