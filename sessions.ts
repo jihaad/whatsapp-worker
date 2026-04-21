@@ -125,6 +125,9 @@ export async function initSession(schoolId: string): Promise<SchoolSession> {
     if (info?.wid?.user) managed.phoneNumber = info.wid.user;
     console.log(`[worker] Session ready for ${schoolId} (${managed.phoneNumber ?? 'unknown'})`);
 
+    // Wait for Chromium to flush IndexedDB to disk before taring the session.
+    await new Promise((r) => setTimeout(r, 5000));
+
     await auth.persistToDatabase(managed.phoneNumber ?? undefined).catch((e) => {
       console.error(`[worker] persist on ready failed for ${schoolId}:`, e);
     });
