@@ -4,7 +4,7 @@ import { initSession, getSession, destroySession, sendMessage, restoreSessions }
 const app = express();
 app.use(express.json());
 
-const PORT = Number(process.env.WHATSAPP_WORKER_PORT ?? 3001);
+const PORT = Number(process.env.PORT ?? process.env.WHATSAPP_WORKER_PORT ?? 3001);
 const SECRET = process.env.WHATSAPP_WORKER_SECRET ?? 'dev-worker-secret';
 
 // ---------------------------------------------------------------------------
