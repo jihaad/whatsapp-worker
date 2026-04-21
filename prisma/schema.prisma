@@ -1,0 +1,568 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  AGENT
+  SCHOOL
+}
+
+enum AgentStatus {
+  ENABLED
+  DISABLED
+}
+
+enum SubscriptionType {
+  MONTHLY
+  COMMISSION
+}
+
+/// How often the school bills its students/parents. Set once at school
+/// creation and immutable afterwards (API PATCH has no field for it). Drives
+/// the cadence shown on the subscription page; not relevant to the payment
+/// page which always charges the outstanding amount.
+enum PaymentPeriod {
+  WEEKLY
+  MONTHLY
+  SEMESTER
+}
+
+/// Mirror of Supabase auth.users. `id` must equal the auth user's UUID.
+/// `deletedAt` is the canonical "archived" flag across all roles — when set,
+/// the user cannot sign in (checked in /api/auth/signin and getCurrentUser).
+model User {
+  id            String    @id @db.Uuid
+  email         String    @unique
+  username      String?   @unique
+  name          String
+  role          Role
+  /// UI locale preference. 'en' or 'so'. Set at user creation, toggled later
+  /// via /api/account/locale. Shells pass this to `<I18nProvider>`.
+  defaultLocale String    @default("so")
+  deletedAt     DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  agent     Agent?
+  school    School?
+
+  @@map("users")
+}
+
+/// Extends a User with role=AGENT. 1:1 — shares the user's UUID as its PK.
+model Agent {
+  id             String      @id @db.Uuid
+  user           User        @relation(fields: [id], references: [id], onDelete: Cascade)
+  phone          String
+  location       String
+  commissionRate Decimal     @db.Decimal(5, 2)
+  status         AgentStatus @default(ENABLED)
+  /// Admin-controlled: when true, the agent can edit their schools' classes /
+  /// grades / fee groups from the drill-down (readOnly flips off). Default off.
+  canEditSchools Boolean     @default(false)
+  lastActiveAt   DateTime?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  schools        School[]
+
+  @@map("agents")
+}
+
+model School {
+  id                 String   @id @default(uuid()) @db.Uuid
+  userId             String?  @unique @db.Uuid
+  user               User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  agentId            String?  @db.Uuid
+  agent              Agent?   @relation(fields: [agentId], references: [id], onDelete: SetNull)
+
+  name               String
+  location           String
+  contactName        String
+  contactPhone       String
+  contactEmail       String?
+  whatsappNumber     String?
+
+  zaadEnabled        Boolean  @default(false)
+  zaadPayoutNumber   String?
+  edahabEnabled      Boolean  @default(false)
+  edahabPayoutNumber String?
+
+  // Subscription (platform fee model for this school)
+  subscriptionType   SubscriptionType @default(MONTHLY)
+  monthlyFee         Decimal? @db.Decimal(10, 2)  // used when type=MONTHLY, set by agent
+  commissionRate     Decimal? @db.Decimal(5, 2)   // used when type=COMMISSION (future)
+  billingDay         Int?                          // 1–28, day of month payment is due
+
+  /// Student billing cadence — set at creation, immutable after (no field in
+  /// PatchSchoolSchema, so the PATCH route can't touch it).
+  paymentPeriod      PaymentPeriod    @default(MONTHLY)
+
+  /// SEMESTER-mode only: the first day of the first semester. Semester
+  /// start dates chain off this (S1 starts here, Sn starts the day after
+  /// Sn-1 ends). Null for WEEKLY / MONTHLY schools.
+  academicYearStart  DateTime? @db.Date
+  /// SEMESTER-mode only: how many semesters (1-6). Immutable — changing it
+  /// requires a school reset (separate admin action).
+  semesterCount      Int?
+
+  verified           Boolean  @default(false)
+  enabled            Boolean  @default(true)
+
+  // WhatsApp Web linking — light metadata; heavy auth blob lives in WhatsAppSession
+  whatsappLinked       Boolean   @default(false)
+  whatsappPhone        String?
+  whatsappLastActivity DateTime?
+
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  paymentCredentials      SchoolPaymentCredentials?
+  whatsappSession         WhatsAppSession?
+  grades                  Grade[]
+  feeGroups               FeeGroup[]
+  classes                 Class[]
+  students                Student[]
+  semesters               SchoolSemester[]
+  invoices                Invoice[]
+  payments                Payment[]
+  notificationSettings    NotificationSettings?
+  notificationTemplates   NotificationTemplate[]
+  notificationLogs        NotificationLog[]
+
+  @@map("schools")
+}
+
+/// Audit trail of significant actions (agent/school creates, updates, archives,
+/// verifications, password resets, payments). `type` and `category` are plain
+/// strings so new activity kinds don't require schema migrations.
+model ActivityLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  type        String
+  category    String
+  title       String
+  description String
+  actor       String
+  /// Denormalized from metadata.schoolId so per-school activity queries hit
+  /// an index instead of scanning + JSON-extracting. Nullable because some
+  /// events (auth, system) aren't school-scoped.
+  schoolId    String?  @db.Uuid
+  metadata    Json?
+  timestamp   DateTime @default(now())
+
+  @@index([category, timestamp(sort: Desc)])
+  @@index([actor, timestamp(sort: Desc)])
+  @@index([schoolId, timestamp(sort: Desc)])
+  @@index([timestamp(sort: Desc)])
+  @@map("activity_log")
+}
+
+/// whatsapp-web.js auth session for a school. `sessionData` is a compressed
+/// tar.gz of the local `.wwebjs_auth/session-<schoolId>/` folder — Postgres
+/// TOAST handles the ~1-3MB rows transparently.
+model WhatsAppSession {
+  schoolId    String   @id @db.Uuid
+  school      School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  sessionData Bytes
+  phoneNumber String?
+  linkedAt    DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("whatsapp_sessions")
+}
+
+/// Academic grade / year group within a school. Bilingual labels (en/so) to
+/// match the school-side UI. A grade owns one or more Classes; every billable
+/// unit is a Class (a "standalone grade" = a grade with one default class).
+model Grade {
+  id        String   @id @default(uuid()) @db.Uuid
+  schoolId  String   @db.Uuid
+  school    School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  nameEn    String
+  nameSo    String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  classes   Class[]
+
+  @@unique([schoolId, nameEn])
+  @@index([schoolId])
+  @@map("grades")
+}
+
+/// Shared pricing bucket — a class references a FeeGroup instead of carrying
+/// its own `monthlyFee`. A class is in at most one fee group.
+model FeeGroup {
+  id         String   @id @default(uuid()) @db.Uuid
+  schoolId   String   @db.Uuid
+  school     School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  name       String
+  monthlyFee Decimal  @db.Decimal(10, 2)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  classes    Class[]
+
+  @@unique([schoolId, name])
+  @@index([schoolId])
+  @@map("fee_groups")
+}
+
+/// A single billable class within a grade. Pricing rule (enforced in API +
+/// Zod): exactly one of `feeGroupId` or `monthlyFee` must be set.
+/// If a FeeGroup is deleted the FK goes NULL and the class needs a fee.
+model Class {
+  id         String    @id @default(uuid()) @db.Uuid
+  schoolId   String    @db.Uuid
+  school     School    @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  gradeId    String    @db.Uuid
+  grade      Grade     @relation(fields: [gradeId], references: [id], onDelete: Cascade)
+  name       String
+
+  feeGroupId String?   @db.Uuid
+  feeGroup   FeeGroup? @relation(fields: [feeGroupId], references: [id], onDelete: SetNull)
+  monthlyFee Decimal?  @db.Decimal(10, 2)
+
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  students   Student[]
+  invoices   Invoice[]
+
+  @@unique([gradeId, name])
+  @@index([schoolId])
+  @@index([feeGroupId])
+  @@map("classes")
+}
+
+/// An enrolled student. `studentNumber` is the school-facing id (e.g. "STD-0001")
+/// — unique per school, not global. `classId` onDelete is Restrict so deleting
+/// a class with students is blocked at the DB level (the API also blocks via
+/// assertClassDeletable — defence in depth). When the Payment model lands, it
+/// will add a Payment.studentId → Student.id FK; no back-relation needed yet.
+model Student {
+  id             String    @id @default(uuid()) @db.Uuid
+  schoolId       String    @db.Uuid
+  school         School    @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  /// Nullable — a student can be registered without a class yet. Becoming
+  /// unassigned also happens when their class is deleted (SetNull); the API
+  /// layer still blocks class deletion while students are in it, so SetNull
+  /// is a safety net, not the default path.
+  classId        String?   @db.Uuid
+  class          Class?    @relation(fields: [classId], references: [id], onDelete: SetNull)
+
+  studentNumber  String
+  name           String
+  parentName     String?
+  parentPhone    String?
+  enrolledAt     DateTime  @default(now())
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  invoices          Invoice[]
+  payments          Payment[]
+  notificationLogs  NotificationLog[]
+
+  @@unique([schoolId, studentNumber])
+  @@index([schoolId])
+  @@index([classId])
+  /// Covers the default paginated list query (students filtered by school,
+  /// ordered by createdAt). `take`/`skip` hit this index directly.
+  @@index([schoolId, createdAt])
+  @@map("students")
+}
+
+/// Sensitive per-school mobile-money merchant credentials. 1:1 with school.
+model SchoolPaymentCredentials {
+  schoolId             String   @id @db.Uuid
+  school               School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  waafipayMerchantUid  String?
+  waafipayApiUserId    String?
+  waafipayApiKey       String?
+
+  edahabApiKey         String?
+  edahabApiSecret      String?
+  edahabAgentCode      String?
+
+  updatedAt            DateTime @updatedAt
+
+  @@map("school_payment_credentials")
+}
+
+/// SEMESTER-mode schools only. Number of rows == School.semesterCount.
+/// Auto-labelled "Semester 1".."Semester N". Start dates are derived at
+/// creation (chain from academicYearStart), end dates are user-entered.
+/// Both are stored so queries don't recompute.
+model SchoolSemester {
+  id         String   @id @default(uuid()) @db.Uuid
+  schoolId   String   @db.Uuid
+  school     School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+  label      String
+  /// 1-based position within the school's semester sequence (1..semesterCount).
+  ordinal    Int
+  startDate  DateTime @db.Date
+  endDate    DateTime @db.Date
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  invoices   Invoice[]
+
+  @@unique([schoolId, ordinal])
+  @@unique([schoolId, startDate])
+  @@index([schoolId, startDate])
+  @@map("school_semesters")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+/// Which message template type is being stored / sent.
+enum NotificationTemplateType {
+  MONTHLY_INVOICE  // sent at the start of a billing period
+  PAYMENT_REMINDER // sent to chase an OPEN / PARTIAL invoice
+}
+
+/// How the notification was triggered.
+enum NotificationTrigger {
+  SCHEDULED // auto-send by the cron job on the configured sendDay
+  MANUAL    // school / admin clicked "Send" for one invoice
+  BULK      // "Remind All Outstanding" batch action from the payments screen
+}
+
+/// Delivery channel. WHATSAPP is the only live channel today; the enum keeps
+/// the door open for SMS / email without a schema migration.
+enum NotificationChannel {
+  WHATSAPP
+}
+
+/// Delivery outcome for a single message.
+enum NotificationStatus {
+  PENDING  // queued, not yet attempted
+  SENT     // WhatsApp accepted the message
+  FAILED   // delivery error (see NotificationLog.error)
+}
+
+enum InvoiceStatus {
+  OPEN
+  PARTIAL
+  PAID
+  VOID
+}
+
+enum PaymentProvider {
+  ZAAD
+  EDAHAB
+  CASH
+  MANUAL
+}
+
+enum PaymentState {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+/// What a student owes for one billing period. Generated eagerly when the
+/// period opens; the student/parent loads it via `/pay/<number>`. `amount`
+/// is a snapshot of the class fee at generation time — later fee edits
+/// don't rewrite history. `paidAmount` and `status` are denormalised for
+/// list queries and kept in sync inside the Payment write transaction.
+model Invoice {
+  id           String         @id @default(uuid()) @db.Uuid
+  /// Short, URL-safe, unguessable — generated via nanoid. In URLs and
+  /// customer-facing references.
+  number       String         @unique
+
+  schoolId     String         @db.Uuid
+  school       School         @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  studentId    String         @db.Uuid
+  student      Student        @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  /// Class snapshot at generation time. If the student later moves class,
+  /// already-generated invoices don't follow.
+  classId      String         @db.Uuid
+  class        Class          @relation(fields: [classId], references: [id], onDelete: Restrict)
+
+  /// Only set when the school's paymentPeriod = SEMESTER. Useful for the
+  /// admin reset flow and for joining invoices to a semester by FK, not
+  /// by date-range matching.
+  semesterId   String?        @db.Uuid
+  semester     SchoolSemester? @relation(fields: [semesterId], references: [id], onDelete: SetNull)
+
+  periodStart  DateTime       @db.Date
+  periodEnd    DateTime       @db.Date
+  /// Precomputed, locale-independent. e.g. "Semester 1 2026", "April 2026",
+  /// "Week 14 2026". Rendered directly on invoice / pay pages.
+  periodLabel  String
+
+  amount       Decimal        @db.Decimal(10, 2)
+  paidAmount   Decimal        @default(0) @db.Decimal(10, 2)
+  status       InvoiceStatus  @default(OPEN)
+
+  /// e.g. billingDay of next period + grace. Drives WhatsApp reminders.
+  dueDate      DateTime?      @db.Date
+  generatedAt  DateTime       @default(now())
+
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  payments          Payment[]
+  notificationLogs  NotificationLog[]
+
+  /// Idempotent generation — re-running the generator for the same period
+  /// is a no-op.
+  @@unique([studentId, periodStart])
+  @@index([schoolId, status, periodStart(sort: Desc)])
+  @@index([studentId, periodStart(sort: Desc)])
+  @@map("invoices")
+}
+
+/// One row per money-received event against an Invoice. Partials allowed
+/// (sum of SUCCEEDED payments ≤ invoice.amount). `transactionRef` + `provider`
+/// is unique to block double-booking the same mobile-money txn. `rawResponse`
+/// captures the provider's payload for audit/debug.
+model Payment {
+  id             String          @id @default(uuid()) @db.Uuid
+
+  schoolId       String          @db.Uuid
+  school         School          @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  invoiceId      String          @db.Uuid
+  invoice        Invoice         @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+
+  /// Denormalised for parent-facing payment history lookups without joining
+  /// through invoice.
+  studentId      String          @db.Uuid
+  student        Student         @relation(fields: [studentId], references: [id], onDelete: Restrict)
+
+  provider       PaymentProvider
+  amount         Decimal         @db.Decimal(10, 2)
+  /// Provider's own transaction ID. Nullable because MANUAL/CASH entries
+  /// don't have one at creation time.
+  transactionRef String?
+  collectedAt    DateTime        @default(now())
+  /// Actor label, same format as ActivityLog.actor (username / email / "system").
+  collectedBy    String?
+  state          PaymentState    @default(PENDING)
+  /// Provider's raw response — JSONB for audit/debug (kept separate from
+  /// metadata so you can strip PII without losing the full trail).
+  rawResponse    Json?
+
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@unique([provider, transactionRef])
+  @@index([invoiceId])
+  @@index([schoolId, collectedAt(sort: Desc)])
+  @@index([studentId, collectedAt(sort: Desc)])
+  @@map("payments")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+/// Per-school notification schedule. 1:1 with School.
+/// Created on first save from the Notifications page; until then the app
+/// uses hard-coded defaults (autoSendEnabled=true, sendDay=10).
+model NotificationSettings {
+  schoolId        String   @id @db.Uuid
+  school          School   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  /// Whether the cron job should auto-send monthly invoices for this school.
+  autoSendEnabled Boolean  @default(true)
+  /// Day of month on which auto-send fires (1–28). 99 = last day of month.
+  sendDay         Int      @default(10)
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("notification_settings")
+}
+
+/// Per-school, per-type WhatsApp message template. 1 row per type per school.
+/// Until a row exists the app falls back to the hard-coded defaults in
+/// src/lib/notifications/templates.ts — so schools that never customise their
+/// template cost zero rows here.
+model NotificationTemplate {
+  id        String                   @id @default(uuid()) @db.Uuid
+  schoolId  String                   @db.Uuid
+  school    School                   @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  type      NotificationTemplateType
+  /// Raw template body with {{placeholder}} variables.
+  body      String
+
+  createdAt DateTime                 @default(now())
+  updatedAt DateTime                 @updatedAt
+
+  @@unique([schoolId, type])
+  @@index([schoolId])
+  @@map("notification_templates")
+}
+
+/// Append-only record of every WhatsApp message attempted. One row per
+/// recipient per send event — bulk sends produce N rows with the same
+/// `batchId` so you can group them or measure delivery rate.
+model NotificationLog {
+  id           String                    @id @default(uuid()) @db.Uuid
+
+  schoolId     String                    @db.Uuid
+  school       School                    @relation(fields: [schoolId], references: [id], onDelete: Cascade)
+
+  /// Nullable — a test message may not be tied to a specific invoice.
+  invoiceId    String?                   @db.Uuid
+  invoice      Invoice?                  @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  /// Denormalised for per-student history queries without joining through invoice.
+  studentId    String?                   @db.Uuid
+  student      Student?                  @relation(fields: [studentId], references: [id], onDelete: SetNull)
+
+  /// Which template was used (null for ad-hoc / custom messages).
+  templateType NotificationTemplateType?
+
+  channel      NotificationChannel       @default(WHATSAPP)
+  trigger      NotificationTrigger
+
+  /// Phone number the message was sent to, captured at send time.
+  recipient    String
+  /// Fully rendered message body — variables already substituted.
+  /// Stored so the admin can see exactly what was sent even after the
+  /// template is edited.
+  body         String
+
+  status       NotificationStatus        @default(PENDING)
+  /// Provider / library error string when status = FAILED.
+  error        String?
+
+  /// Groups all rows produced by a single bulk action so they can be
+  /// counted or filtered together. Null for individual sends.
+  batchId      String?                   @db.Uuid
+
+  /// Username or "system" (for scheduled sends).
+  triggeredBy  String
+  /// Timestamp when the provider accepted (or rejected) the message.
+  /// Null while still PENDING.
+  sentAt       DateTime?
+
+  createdAt    DateTime                  @default(now())
+
+  @@index([schoolId, createdAt(sort: Desc)])
+  @@index([invoiceId])
+  @@index([studentId, createdAt(sort: Desc)])
+  /// Lets you fetch all rows from a bulk action in one query.
+  @@index([batchId])
+  @@map("notification_logs")
+}
