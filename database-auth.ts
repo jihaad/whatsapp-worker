@@ -73,9 +73,6 @@ export class DatabaseAuth extends LocalAuth {
 
     this.afterAuthReady = async () => {
       await parentAfterAuthReady();
-      await this.persistToDatabase().catch((e) => {
-        console.error(`[DatabaseAuth] persist failed for ${this.schoolId}:`, e);
-      });
     };
 
     this.logout = async () => {
