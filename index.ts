@@ -91,7 +91,7 @@ app.post('/sessions/:schoolId/send', async (req, res) => {
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`[worker] WhatsApp worker listening on http://localhost:${PORT}`);
   console.log(`[worker] Restoring saved sessions…`);
   void restoreSessions();
