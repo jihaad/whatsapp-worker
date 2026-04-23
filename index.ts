@@ -1,5 +1,39 @@
 import express from 'express';
-import { initSession, getSession, destroySession, sendMessage, restoreSessions } from './sessions';
+import { initSession, getSession, destroySession, sendMessage, restoreSessions, persistAndDestroyAll } from './sessions';
+
+// whatsapp-web.js attaches an async `framenavigated` listener that calls
+// `this.inject()` without a try/catch (Client.js ~L383). When WhatsApp Web
+// navigates mid-inject the puppeteer call throws "Execution context was
+// destroyed", which surfaces here as an unhandled rejection and — under
+// Node's default — kills the worker. Swallow these transient puppeteer
+// rejections so one blip doesn't take down every session.
+const TRANSIENT_PUPPETEER_ERRORS = [
+  'Execution context was destroyed',
+  'Target closed',
+  'Session closed',
+  'Protocol error',
+];
+const isTransientPuppeteerError = (msg: string) =>
+  TRANSIENT_PUPPETEER_ERRORS.some((needle) => msg.includes(needle));
+
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  if (isTransientPuppeteerError(msg)) {
+    console.warn('[worker] swallowed transient puppeteer rejection:', msg);
+    return;
+  }
+  console.error('[worker] unhandledRejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (isTransientPuppeteerError(msg)) {
+    console.warn('[worker] swallowed transient puppeteer exception:', msg);
+    return;
+  }
+  console.error('[worker] uncaughtException:', err);
+  process.exit(1);
+});
 
 const app = express();
 app.use(express.json());
@@ -88,11 +122,22 @@ app.listen(PORT, '0.0.0.0', () => {
   void restoreSessions();
 });
 
-// Graceful shutdown — destroy all active Chromium instances cleanly
+// Graceful shutdown — close Chromium cleanly and persist settled sessions
+// to the DB so the next start can restore without a fresh QR. Re-entrant:
+// if two signals arrive close together (ctrl-c then SIGTERM from tsx watch)
+// the second one is a no-op while the first finishes.
+let shuttingDown = false;
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log('[worker] Shutting down…');
+  try {
+    await persistAndDestroyAll();
+  } catch (e) {
+    console.error('[worker] shutdown persist error:', e);
+  }
   process.exit(0);
 }

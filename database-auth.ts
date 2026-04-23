@@ -73,6 +73,12 @@ export class DatabaseAuth extends LocalAuth {
 
     this.afterAuthReady = async () => {
       await parentAfterAuthReady();
+      // Do NOT persist here. afterAuthReady fires during the auth window
+      // before the IndexedDB / LevelDB has finished hydrating from disk on
+      // a restore, and before the full message store has synced on a fresh
+      // link. Tarring mid-hydration captures a half-compacted LevelDB tree
+      // that restores cleanly to a broken session. The 'ready' handler in
+      // sessions.ts does the real persist after a 5s flush window.
     };
 
     this.logout = async () => {
@@ -90,7 +96,10 @@ export class DatabaseAuth extends LocalAuth {
         where: { schoolId: this.schoolId },
         select: { sessionData: true },
       });
-      if (!saved?.sessionData) return;
+      if (!saved?.sessionData) {
+        console.log(`[DatabaseAuth] no saved session blob for ${this.schoolId} — fresh link flow`);
+        return;
+      }
 
       mkdirSync(this.resolvedDataPath, { recursive: true });
       await rmrf(sessionDir);
@@ -99,6 +108,7 @@ export class DatabaseAuth extends LocalAuth {
       await writeFile(tmpTar, Buffer.from(saved.sessionData));
       try {
         await extract({ file: tmpTar, cwd: this.resolvedDataPath });
+        console.log(`[DatabaseAuth] restored ${Buffer.from(saved.sessionData).length} bytes → ${sessionDir}`);
       } finally {
         await rm(tmpTar, { force: true });
       }
@@ -115,7 +125,6 @@ export class DatabaseAuth extends LocalAuth {
   async persistToDatabase(phoneNumber?: string): Promise<void> {
     const sessionDirName = `session-${this.schoolId}`;
     const sessionDir = join(this.resolvedDataPath, sessionDirName);
-    console.log(`[DatabaseAuth] persist check: sessionDir=${sessionDir} exists=${existsSync(sessionDir)}`);
     if (!existsSync(sessionDir)) return;
 
     const snapshotRoot = join(this.resolvedDataPath, `.snapshot-${this.schoolId}`);
@@ -130,6 +139,11 @@ export class DatabaseAuth extends LocalAuth {
       await create({ gzip: true, file: tmpTar, cwd: snapshotRoot }, [sessionDirName]);
       const blob = await readFile(tmpTar);
 
+      // NOT wrapped in $transaction — this runs against Supabase's
+      // transaction-mode pgBouncer pooler in prod, which can't hold a
+      // connection across BEGIN/COMMIT and fails every transaction with
+      // P2028. Sequential upserts are idempotent; if the second call fails
+      // the next successful persist will re-converge.
       await prisma.whatsAppSession.upsert({
         where: { schoolId: this.schoolId },
         create: { schoolId: this.schoolId, sessionData: blob, phoneNumber: phoneNumber ?? null },
