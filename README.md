@@ -24,6 +24,7 @@ over HTTPS for everything WhatsApp-related.
 ├── prisma/
 │   ├── schema.prisma          # vendored copy — see "Schema sync"
 │   └── generated/client/      # output of `prisma generate` (gitignored)
+├── prisma.config.ts           # Prisma 7 CLI config — feeds DIRECT_URL to migrate/generate
 ├── src/
 │   ├── index.ts               # express app + signal handlers + boot
 │   ├── sessions.ts            # whatsapp-web.js session lifecycle
@@ -199,7 +200,10 @@ Workflow on every FD schema change that touches `WhatsAppSession`:
 1. Apply the change in FD with `npx prisma migrate dev --name <descriptive>`.
 2. Copy the model block into `prisma/schema.prisma` in this repo
    (preserve the worker's `output = "./generated/client"` generator line —
-   FD's points elsewhere).
+   FD's points elsewhere). Don't copy FD's `url = env(...)` line into the
+   `datasource db` block: Prisma 7 doesn't accept it in the schema, and the
+   worker reads `DIRECT_URL` via [`prisma.config.ts`](prisma.config.ts) for
+   CLI commands and via the `PrismaPg` adapter at runtime.
 3. `npm run generate` — confirms TypeScript still compiles.
 4. Commit + push. The systemd-managed worker on the ThinkPad picks up
    on next deploy.
