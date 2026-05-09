@@ -77,10 +77,9 @@ npm run dev                   # tsx watch — restarts on save
 
 ## Production deploy (ThinkPad X250t · Ubuntu 22.04 LTS)
 
-The architecture, threat model, and detailed runbook live in the FD repo
-at
-[`docs/whatsapp-worker-api-plan.md`](https://github.com/jihaad/fududeey-waxbarasho/blob/main/docs/whatsapp-worker-api-plan.md).
-The summary below is the operator's checklist.
+Pending work (auth, rate limits, host bring-up) is tracked in
+[`TODO.md`](TODO.md). The summary below is the operator's checklist for
+a fresh host.
 
 ### 1. Base OS hardening
 
@@ -263,7 +262,7 @@ sudo systemctl restart fd-worker
 - **Re-entrant transient handlers** — Puppeteer's "Execution context was
   destroyed" / "Target closed" errors are caught and logged, not crashy.
 
-Pending (per the FD repo's `TODO.md` §2):
+Pending (see [`TODO.md`](TODO.md) §2):
 
 - Per-recipient cooldown (LRU)
 - Daily quota (resets 00:00 EAT)
