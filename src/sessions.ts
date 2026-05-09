@@ -6,10 +6,14 @@ import { prisma } from './prisma';
 /**
  * Long-lived session manager for the WhatsApp worker process.
  *
- * Unlike the embedded Next.js version, this runs in a stable process that is
- * never hot-reloaded, so there are no orphaned Chromium processes to clean up.
- * Session blobs persist in `whatsapp_sessions` — Chromium restores from the DB
- * on worker startup without requiring a new QR scan.
+ * The worker is the **transport layer** — it knows about WhatsApp Web
+ * sessions keyed by an opaque `schoolId` UUID, nothing else. No knowledge
+ * of FD's domain models (schools, students, classes, invoices, payments).
+ * FD reports the linked status to its UI by polling the worker's HTTP API.
+ *
+ * Session blobs persist in `whatsapp_sessions.sessionData` as tar.gz —
+ * Chromium restores from the DB on worker startup without requiring a new
+ * QR scan. Status is held in-memory only.
  */
 
 export type SessionStatus = 'disconnected' | 'connecting' | 'qr_pending' | 'ready';
@@ -95,17 +99,11 @@ async function tryInitialize(client: Client, schoolId: string): Promise<void> {
  * event fired on a restore means WhatsApp rejected the saved auth blob (usual
  * cause: snapshot taken mid-LevelDB-write, or the device was revoked from the
  * phone). In that case we drop the dead DB row so the next restart doesn't
- * keep retrying the bad blob and the UI accurately reports "not linked".
+ * keep retrying the bad blob.
  */
 export async function initSession(schoolId: string, isRestore = false): Promise<SchoolSession> {
   const existing = sessions.get(schoolId);
   if (existing) {
-    if (existing.status === 'ready') {
-      void prisma.school.update({
-        where: { id: schoolId },
-        data: { whatsappLinked: true, whatsappPhone: existing.phoneNumber ?? null, whatsappLastActivity: new Date() },
-      }).catch(() => {});
-    }
     return toSchoolSession(schoolId, existing);
   }
 
@@ -165,13 +163,7 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
       if (isRestore && !qrSeen) {
         qrSeen = true;
         console.warn(`[worker] restore rejected by WhatsApp for ${schoolId} — dropping stale blob`);
-        // Separate awaits — the delete can 404 when the row was already
-        // cleared, and we don't want that to roll back the school update.
         await prisma.whatsAppSession.delete({ where: { schoolId } }).catch(() => {});
-        await prisma.school.update({
-          where: { id: schoolId },
-          data: { whatsappLinked: false, whatsappPhone: null },
-        }).catch((e) => console.error(`[worker] school flag reset failed for ${schoolId}:`, e));
       }
     } catch {
       managed.qrDataUrl = null;
@@ -197,10 +189,6 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
     await auth.persistToDatabase(managed.phoneNumber ?? undefined).catch((e) => {
       console.error(`[worker] persist on ready failed for ${schoolId}:`, e);
     });
-    await prisma.school.update({
-      where: { id: schoolId },
-      data: { whatsappLinked: true, whatsappPhone: managed.phoneNumber ?? null, whatsappLastActivity: new Date() },
-    }).catch((e) => console.error(`[worker] school update failed for ${schoolId}:`, e));
   });
 
   client.on('authenticated', () => {
@@ -246,6 +234,12 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
  * Restore all previously-linked sessions on worker startup.
  * Fires each initSession() in the background so the worker HTTP server
  * is available immediately while Chromium boots in the background.
+ *
+ * **Pure-API note:** this used to filter by `school.user.deletedAt` to
+ * skip sessions for soft-deleted schools. The worker no longer has that
+ * cross-table knowledge; it trusts `whatsapp_sessions` as the source of
+ * truth. FD is responsible for calling `DELETE /sessions/:schoolId` when
+ * a school is soft-deleted so the row is cleaned up here too.
  */
 export async function restoreSessions(): Promise<void> {
   const ids = new Set<string>();
@@ -260,30 +254,23 @@ export async function restoreSessions(): Promise<void> {
   while (attempt < MAX_ATTEMPTS) {
     attempt++;
     try {
-      // Skip soft-deleted schools — otherwise their Chromium still boots on
-      // every worker restart and persists forever. deletedAt sits on the
-      // linked User, not on School directly.
       const saved = await prisma.whatsAppSession.findMany({
-        where: { school: { user: { deletedAt: null } } },
         select: { schoolId: true },
       });
       for (const row of saved) ids.add(row.schoolId);
 
-      // Also pick up any local session folders left by a previous run — but
-      // only if the school still exists and isn't deleted. Without this check
-      // a stale on-disk folder for an archived school would resurrect Chromium
-      // on every worker restart.
+      // Also pick up any local session folders left by a previous run.
+      // Without cross-table knowledge of FD's School table, we trust the
+      // disk match for any UUID-shaped folder name — the next boot can
+      // still emit a fresh QR if WhatsApp rejects it, at which point the
+      // row gets dropped (see initSession's `isRestore` path).
       try {
         const fs = await import('node:fs/promises');
         const entries = await fs.readdir(getSessionDir()).catch(() => [] as string[]);
         const UUID = /^session-([0-9a-f-]{36})$/i;
-        const diskIds = entries.map((n) => n.match(UUID)?.[1]).filter((v): v is string => !!v);
-        if (diskIds.length) {
-          const active = await prisma.school.findMany({
-            where: { id: { in: diskIds }, user: { deletedAt: null } },
-            select: { id: true },
-          });
-          for (const s of active) ids.add(s.id);
+        for (const entry of entries) {
+          const m = entry.match(UUID);
+          if (m?.[1]) ids.add(m[1]);
         }
       } catch { /* FS scan is best-effort */ }
       break; // success — fall through to the fan-out
@@ -373,12 +360,6 @@ export async function persistAndDestroyAll(timeoutMs = 30_000): Promise<void> {
 export async function getSession(schoolId: string): Promise<SchoolSession | null> {
   const managed = sessions.get(schoolId);
   if (managed) {
-    if (managed.status === 'ready') {
-      void prisma.school.update({
-        where: { id: schoolId },
-        data: { whatsappLinked: true, whatsappPhone: managed.phoneNumber ?? null, whatsappLastActivity: new Date() },
-      }).catch(() => {});
-    }
     return toSchoolSession(schoolId, managed);
   }
 
@@ -394,6 +375,33 @@ export async function getSession(schoolId: string): Promise<SchoolSession | null
   return null;
 }
 
+/**
+ * List every session the worker currently knows about — used by FD to
+ * render its dashboards/sidebars without storing a denormalised
+ * `school.whatsappLinked` flag. Returns sessions for both in-memory
+ * (live) and saved-only (disconnected since restart) states.
+ */
+export async function listSessions(): Promise<SchoolSession[]> {
+  const live = Array.from(sessions.entries()).map(([id, m]) => toSchoolSession(id, m));
+  const liveIds = new Set(live.map((s) => s.schoolId));
+
+  const saved = await prisma.whatsAppSession.findMany({
+    select: { schoolId: true, phoneNumber: true, updatedAt: true },
+  });
+
+  const offline: SchoolSession[] = saved
+    .filter((row) => !liveIds.has(row.schoolId))
+    .map((row) => ({
+      schoolId: row.schoolId,
+      status: 'disconnected' as const,
+      qrDataUrl: null,
+      phoneNumber: row.phoneNumber,
+      lastActivity: row.updatedAt.toISOString(),
+    }));
+
+  return [...live, ...offline];
+}
+
 export async function destroySession(schoolId: string): Promise<void> {
   const managed = sessions.get(schoolId);
   if (managed) {
@@ -402,10 +410,6 @@ export async function destroySession(schoolId: string): Promise<void> {
     sessions.delete(schoolId);
   }
   try { await prisma.whatsAppSession.delete({ where: { schoolId } }); } catch { /* may not exist */ }
-  await prisma.school.update({
-    where: { id: schoolId },
-    data: { whatsappLinked: false, whatsappPhone: null },
-  }).catch(() => {});
 }
 
 export async function sendMessage(schoolId: string, to: string, body: string): Promise<SendMessageResult> {
@@ -451,7 +455,6 @@ export async function sendMessage(schoolId: string, to: string, body: string): P
     stage = 'sendMessage';
     const msg = await managed.client.sendMessage(numberId._serialized, body);
     managed.lastActivity = new Date().toISOString();
-    prisma.school.update({ where: { id: schoolId }, data: { whatsappLastActivity: new Date() } }).catch(() => {});
     return { success: true, messageId: msg.id?.id ?? null, recipientPhone: to, timestamp: new Date().toISOString() };
   } catch (error) {
     const stack = error instanceof Error ? error.stack : String(error);
@@ -506,9 +509,6 @@ function toSchoolSession(schoolId: string, m: ManagedSession): SchoolSession {
  *   - Norway & Denmark 8-digit no-0 locals collide with each other.
  *   - Iceland 7-digit no-0 is too short to classify safely.
  *   - Somali 061 / 068 etc. collide with NL 06X (063/065 wins as SO).
- *
- * When adding a new country, extend the ladder and the test harness in
- * worker/__tests__/normalize.ts (or re-run the inline test snippet).
  */
 function normalizeToWhatsAppId(phone: string): string {
   const trimmed = phone.trim();

@@ -1,0 +1,23 @@
+# Cloudflare Tunnel config for fd-whatsapp-worker.
+#
+# Install location: /etc/cloudflared/config.yml
+# Set up via:
+#   sudo cloudflared tunnel login
+#   sudo cloudflared tunnel create fd-worker
+#   sudo cloudflared tunnel route dns fd-worker worker.fududeeye.so
+#   sudo cloudflared service install
+#
+# After install, the credentials JSON path (line below) is filled in by
+# `cloudflared tunnel create`. Update <tunnel-id> with the real UUID.
+
+tunnel: fd-worker
+credentials-file: /etc/cloudflared/<tunnel-id>.json
+
+ingress:
+  - hostname: worker.fududeeye.so
+    service: http://127.0.0.1:3001
+  - service: http_status:404
+
+# Local metrics endpoint — useful for `curl http://127.0.0.1:9090/metrics`
+# during incident triage. Not exposed publicly.
+metrics: 127.0.0.1:9090

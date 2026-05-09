@@ -1,5 +1,19 @@
 import express from 'express';
-import { initSession, getSession, destroySession, sendMessage, restoreSessions, persistAndDestroyAll } from './sessions';
+import { initSession, getSession, listSessions, destroySession, sendMessage, restoreSessions, persistAndDestroyAll } from './sessions';
+import { isQuietHour, secondsUntilNextSendWindow, sleepJitter } from './anti-ban';
+
+/**
+ * fd-whatsapp-worker — pure-API entry point.
+ *
+ * The worker is a transport-only service. FD calls these endpoints over
+ * HTTPS (via Cloudflare Tunnel) for QR-linking, status polling, and
+ * sending messages. It has no internal queue, no FD database access
+ * beyond its own `whatsapp_sessions` table, and no domain knowledge of
+ * schools / students / classes.
+ *
+ * Auth: legacy shared `WHATSAPP_WORKER_SECRET` header until Phase 1 of
+ * the design plan replaces it with HMAC-signed service tokens.
+ */
 
 // whatsapp-web.js attaches an async `framenavigated` listener that calls
 // `this.inject()` without a try/catch (Client.js ~L383). When WhatsApp Web
@@ -36,16 +50,17 @@ process.on('uncaughtException', (err) => {
 });
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '256kb' }));
 
 const PORT = Number(process.env.PORT ?? process.env.WHATSAPP_WORKER_PORT ?? 3001);
+const HOST = process.env.WHATSAPP_WORKER_HOST ?? '127.0.0.1';
 const SECRET = process.env.WHATSAPP_WORKER_SECRET ?? 'dev-worker-secret';
 
 // ---------------------------------------------------------------------------
-// Auth middleware — shared secret header so only the Next.js app can call this
+// Auth middleware — shared secret header so only the FD app can call this.
+// `/health` is public for Cloudflare Tunnel + uptime monitor probes.
 // ---------------------------------------------------------------------------
 app.use((req, res, next) => {
-  // Health check is always public
   if (req.path === '/health') return next();
 
   const header = req.headers['x-worker-secret'];
@@ -57,11 +72,26 @@ app.use((req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Routes
+// Health
 // ---------------------------------------------------------------------------
 
 app.get('/health', (_, res) => {
   res.json({ ok: true, uptime: process.uptime() });
+});
+
+// ---------------------------------------------------------------------------
+// Sessions — CRUD + polling
+// ---------------------------------------------------------------------------
+
+/** List every known session. Drives FD's dashboards/sidebars. */
+app.get('/sessions', async (_req, res) => {
+  try {
+    const sessions = await listSessions();
+    res.json({ sessions });
+  } catch (err) {
+    console.error('[worker] GET /sessions:', err);
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to list sessions' });
+  }
 });
 
 /** Init or return the current session for a school. */
@@ -97,14 +127,76 @@ app.delete('/sessions/:schoolId', async (req, res) => {
   }
 });
 
-/** Send a WhatsApp message. Body: { to, body } */
-app.post('/sessions/:schoolId/send', async (req, res) => {
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+/**
+ * Send a single WhatsApp message. Body: `{ schoolId, recipient, body }`.
+ *
+ * Anti-ban posture applied inline: quiet-hours guard rejects with 503 +
+ * `Retry-After`, then a 5–15s random jitter before the actual send.
+ * Caller waits up to ~15s for the synchronous response.
+ *
+ * For bulk sends, the FD-side cron iterates due reminders and POSTs each
+ * one individually — no internal queue here.
+ */
+app.post('/messages/send', async (req, res) => {
+  const { schoolId, recipient, body } = req.body as {
+    schoolId?: string; recipient?: string; body?: string;
+  };
+
+  if (!schoolId || !recipient || !body) {
+    res.status(400).json({ error: '`schoolId`, `recipient`, and `body` are required' });
+    return;
+  }
+
+  if (isQuietHour()) {
+    const retryAfter = secondsUntilNextSendWindow();
+    res.set('Retry-After', String(retryAfter));
+    res.status(503).json({
+      error: 'Quiet hours — sends paused outside 07:00–21:00 EAT',
+      code: 'QUIET_HOURS',
+      retryAfter,
+    });
+    return;
+  }
+
   try {
-    const { to, body } = req.body as { to?: string; body?: string };
-    if (!to || !body) {
-      res.status(400).json({ error: '`to` and `body` are required' });
-      return;
-    }
+    await sleepJitter();
+    const result = await sendMessage(schoolId, recipient, body);
+    res.status(result.success ? 200 : 502).json(result);
+  } catch (err) {
+    console.error(`[worker] POST /messages/send for ${schoolId} → ${recipient}:`, err);
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to send message' });
+  }
+});
+
+/**
+ * Legacy alias — kept while FD migrates from `/sessions/:id/send` to the
+ * unified `/messages/send`. Delete once `src/lib/whatsapp-worker/client.ts`
+ * on the FD side is updated to call the new path. Same anti-ban posture.
+ */
+app.post('/sessions/:schoolId/send', async (req, res) => {
+  const { to, body } = req.body as { to?: string; body?: string };
+  if (!to || !body) {
+    res.status(400).json({ error: '`to` and `body` are required' });
+    return;
+  }
+
+  if (isQuietHour()) {
+    const retryAfter = secondsUntilNextSendWindow();
+    res.set('Retry-After', String(retryAfter));
+    res.status(503).json({
+      error: 'Quiet hours — sends paused outside 07:00–21:00 EAT',
+      code: 'QUIET_HOURS',
+      retryAfter,
+    });
+    return;
+  }
+
+  try {
+    await sleepJitter();
     const result = await sendMessage(req.params.schoolId, to, body);
     res.status(result.success ? 200 : 502).json(result);
   } catch (err) {
@@ -116,8 +208,9 @@ app.post('/sessions/:schoolId/send', async (req, res) => {
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[worker] WhatsApp worker listening on http://localhost:${PORT}`);
+
+app.listen(PORT, HOST, () => {
+  console.log(`[worker] WhatsApp worker listening on http://${HOST}:${PORT}`);
   console.log(`[worker] Restoring saved sessions…`);
   void restoreSessions();
 });

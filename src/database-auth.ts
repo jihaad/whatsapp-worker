@@ -6,6 +6,29 @@ import { create, extract } from 'tar';
 import { prisma } from './prisma';
 
 /**
+ * Chromium cache directories that bloat a long-running session profile but
+ * are NOT needed to restore the WhatsApp Web auth state — Chromium
+ * regenerates them on next start. Excluding them from the persisted blob
+ * keeps the upload small enough to finish within Supabase's statement
+ * timeout (we've seen sessions grow to 180MB+ after a few weeks; 149MB of
+ * that was these caches).
+ *
+ * Match against POSIX paths inside the tarball — tar normalises separators
+ * regardless of host OS.
+ */
+const CACHE_DIR_PATTERNS = [
+  '/Default/Cache/',
+  '/Default/Code Cache/',
+  '/Default/GPUCache/',
+  '/Default/DawnWebGPUCache/',
+  '/Default/DawnGraphiteCache/',
+];
+
+function isDisposableCachePath(path: string): boolean {
+  return CACHE_DIR_PATTERNS.some((needle) => path.includes(needle));
+}
+
+/**
  * Copy a directory tree, retrying on ENOENT. WhatsApp Web's IndexedDB lives
  * in a LevelDB folder that compacts in the background — older `.log` files
  * get rewritten/deleted while we're trying to copy.
@@ -49,9 +72,14 @@ async function rmrf(path: string, attempts = 5): Promise<void> {
 }
 
 /**
- * Custom auth strategy: session data lives in the database (whatsapp_sessions.sessionData),
- * compressed as tar.gz. Before Puppeteer launches we extract the blob to the local session
- * folder; after ready we upload the folder back to the DB.
+ * Custom auth strategy: session data lives in the database
+ * (`whatsapp_sessions.sessionData`), compressed as tar.gz. Before Puppeteer
+ * launches we extract the blob to the local session folder; after ready we
+ * upload the folder back to the DB.
+ *
+ * **Pure-API note:** this class only writes to its own table. It does NOT
+ * touch any FD domain table (no `school.whatsappLinked` flag updates). The
+ * worker reports session state via the HTTP API; FD reads it from there.
  */
 export class DatabaseAuth extends LocalAuth {
   private readonly schoolId: string;
@@ -136,26 +164,25 @@ export class DatabaseAuth extends LocalAuth {
       mkdirSync(snapshotRoot, { recursive: true });
       await copyDirWithRetry(sessionDir, snapshotSession);
 
-      await create({ gzip: true, file: tmpTar, cwd: snapshotRoot }, [sessionDirName]);
+      await create(
+        {
+          gzip: true,
+          file: tmpTar,
+          cwd: snapshotRoot,
+          filter: (path) => !isDisposableCachePath(path),
+        },
+        [sessionDirName],
+      );
       const blob = await readFile(tmpTar);
+      console.log(`[DatabaseAuth] persisting ${this.schoolId}: ${(blob.byteLength / 1024 / 1024).toFixed(1)}MB`);
 
-      // NOT wrapped in $transaction — this runs against Supabase's
-      // transaction-mode pgBouncer pooler in prod, which can't hold a
-      // connection across BEGIN/COMMIT and fails every transaction with
-      // P2028. Sequential upserts are idempotent; if the second call fails
-      // the next successful persist will re-converge.
+      // Only the worker's own table is touched. FD's `school.whatsapp*`
+      // columns are FD's responsibility — it polls the worker API and
+      // updates them on its side.
       await prisma.whatsAppSession.upsert({
         where: { schoolId: this.schoolId },
         create: { schoolId: this.schoolId, sessionData: blob, phoneNumber: phoneNumber ?? null },
         update: { sessionData: blob, ...(phoneNumber ? { phoneNumber } : {}) },
-      });
-      await prisma.school.update({
-        where: { id: this.schoolId },
-        data: {
-          whatsappLinked: true,
-          whatsappLastActivity: new Date(),
-          ...(phoneNumber ? { whatsappPhone: phoneNumber } : {}),
-        },
       });
       console.log(`[DatabaseAuth] session persisted for ${this.schoolId}`);
     } finally {
@@ -168,9 +195,5 @@ export class DatabaseAuth extends LocalAuth {
     try {
       await prisma.whatsAppSession.delete({ where: { schoolId: this.schoolId } });
     } catch { /* row may not exist */ }
-    await prisma.school.update({
-      where: { id: this.schoolId },
-      data: { whatsappLinked: false, whatsappPhone: null },
-    }).catch(() => {});
   }
 }

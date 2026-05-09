@@ -1,29 +1,33 @@
 {
-  "name": "whatsapp-worker",
-  "version": "1.0.0",
+  "name": "fd-whatsapp-worker",
+  "version": "0.1.0",
   "private": true,
+  "description": "Pure-API WhatsApp Web worker for Fududeeye Waxbarasho. Transport-only — owns whatsapp_sessions in Supabase, exposes HTTPS endpoints (link, status, send) for the FD app to call. No FD domain knowledge.",
+  "engines": {
+    "node": ">=20.6.0"
+  },
   "scripts": {
-    "dev": "tsx watch index.ts",
-    "start": "node --max-old-space-size=256 node_modules/.bin/tsx index.ts",
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
     "generate": "prisma generate"
   },
   "dependencies": {
-    "@prisma/adapter-pg": "^7.7.0",
-    "@prisma/client": "^7.7.0",
-    "express": "^4.21.2",
+    "@prisma/adapter-pg": "^7.8.0",
+    "@prisma/client": "^7.8.0",
+    "express": "^4.22.1",
     "pg": "^8.20.0",
     "qrcode": "^1.5.4",
     "tar": "^7.5.13",
-    "whatsapp-web.js": "^1.34.6"
+    "whatsapp-web.js": "^1.34.7"
   },
   "devDependencies": {
-    "@types/express": "^5.0.3",
-    "@types/node": "^20",
+    "@types/express": "^5.0.6",
+    "@types/node": "^20.19.39",
     "@types/pg": "^8.20.0",
     "@types/qrcode": "^1.5.6",
     "@types/tar": "^6.1.13",
-    "prisma": "^7.7.0",
+    "prisma": "^7.8.0",
     "tsx": "^4.21.0",
-    "typescript": "^5"
+    "typescript": "^5.9.3"
   }
 }
