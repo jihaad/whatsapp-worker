@@ -38,15 +38,28 @@ export function sleepJitter(): Promise<void> {
 
 // --- Quiet hours ---------------------------------------------------------
 
-const QUIET_HOUR_START = 7;  // inclusive: first hour we send (07:00 EAT)
-const QUIET_HOUR_END = 21;   // exclusive: first hour we stop  (21:00 EAT)
+export const QUIET_HOUR_START = Number(process.env.QUIET_HOUR_START ?? 7);
+export const QUIET_HOUR_END   = Number(process.env.QUIET_HOUR_END   ?? 21);
+export const QUIET_HOUR_TZ    = process.env.QUIET_HOUR_TZ ?? 'Africa/Nairobi';
 
-/** True when local time in `Africa/Nairobi` is outside the send window. */
+const pad = (h: number) => String(h).padStart(2, '0');
+export const QUIET_HOURS_MESSAGE =
+  `Quiet hours — sends paused outside ${pad(QUIET_HOUR_START)}:00–${pad(QUIET_HOUR_END)}:00 (${QUIET_HOUR_TZ})`;
+
+// Reuse a single formatter instance — Intl.DateTimeFormat construction is
+// expensive and these are called on every send request.
+const eatHourFmt = new Intl.DateTimeFormat('en-GB', {
+  timeZone: QUIET_HOUR_TZ, hour: 'numeric', hour12: false,
+});
+const eatPartsFmt = new Intl.DateTimeFormat('en-GB', {
+  timeZone: QUIET_HOUR_TZ,
+  hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false,
+});
+
+/** True when local time in the configured timezone is outside the send window. */
 export function isQuietHour(now: Date = new Date()): boolean {
   // `Intl` with explicit IANA TZ — works regardless of the host's system clock.
-  const hh = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Africa/Nairobi', hour: 'numeric', hour12: false,
-  }).format(now);
+  const hh = eatHourFmt.format(now);
   const hour = parseInt(hh, 10);
   return hour < QUIET_HOUR_START || hour >= QUIET_HOUR_END;
 }
@@ -57,10 +70,7 @@ export function isQuietHour(now: Date = new Date()): boolean {
  * the value sane on clock drift.
  */
 export function secondsUntilNextSendWindow(now: Date = new Date()): number {
-  const eatNow = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Africa/Nairobi',
-    hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false,
-  }).formatToParts(now);
+  const eatNow = eatPartsFmt.formatToParts(now);
   const get = (type: string) => parseInt(eatNow.find((p) => p.type === type)?.value ?? '0', 10);
   const hour = get('hour');
   const minute = get('minute');
