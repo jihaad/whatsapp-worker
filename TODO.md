@@ -85,7 +85,46 @@ The README has the full step-by-step. This is the operator's checklist.
 
 ---
 
-## 5. Observability
+## 5. Docker deployment — laptop, 24/7
+
+Run the worker and Cloudflare Tunnel as Docker containers so the whole stack starts automatically on boot and restarts itself if it crashes — no Node, no cloudflared, no systemd service to manage manually on the host.
+
+### Prerequisites (one-time, on the laptop)
+- [ ] Install Docker Engine (not Docker Desktop): `curl -fsSL https://get.docker.com | sh && sudo usermod -aG docker $USER`
+- [ ] Lid-close override so the laptop doesn't sleep when shut: add `HandleLidSwitch=ignore` to `/etc/systemd/logind.conf`, then `sudo systemctl restart systemd-logind`.
+- [ ] Disable suspend on power button and idle: `sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target`
+- [ ] Keep it plugged in — UPS or surge protector recommended.
+
+### Write the Dockerfile
+- [ ] Create `Dockerfile` in the repo root. Base on `node:22-bookworm-slim`. Install Google Chrome stable from the official `.deb` (not `apt install chromium-browser` — that's a snap and breaks Puppeteer). Set `PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable` and `PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true`. Copy source, run `npm ci --omit=dev && npm run generate`, expose port 3001.
+
+### Write docker-compose.yml
+- [ ] Create `docker-compose.yml` with two services:
+  - **worker** — builds from the Dockerfile, `restart: unless-stopped`, mounts `.env` as env_file, mounts named volumes for session data (`.wwebjs_auth`) and cache (`.wwebjs_cache`) so QR scans survive container restarts, adds `--cap-add=SYS_ADMIN` (required for Chromium sandbox inside Docker) or keep `--no-sandbox` and drop the cap.
+  - **tunnel** — `image: cloudflare/cloudflared:latest`, `restart: unless-stopped`, command: `tunnel --url http://worker:3001` (uses the internal Docker network — no localhost needed), depends_on: worker.
+
+### Start it
+```bash
+docker compose up -d          # start both containers in background
+docker compose logs -f        # watch live logs from both
+docker compose restart worker # restart just the worker after a code change
+```
+
+### Auto-start on boot
+- [ ] Enable Docker to start on boot: `sudo systemctl enable docker` (done automatically by the get.docker.com script).
+- [ ] `docker compose up -d` on boot is automatic because `restart: unless-stopped` brings containers back up when the Docker daemon starts.
+- [ ] Optionally add a systemd unit that runs `docker compose up -d` from the repo directory on boot, in case the laptop was hard-powered-off while containers were stopped.
+
+### Updating the worker
+```bash
+git pull
+docker compose build worker
+docker compose up -d --no-deps worker   # zero-downtime swap (tunnel stays up)
+```
+
+---
+
+## 6. Observability
 
 - [ ] Stable log prefixes already in use (`[wa-worker]`, `[wa-session:<id>]`); make sure every catch in `src/sessions.ts` and `src/index.ts` includes one.
 - [ ] `/health` returns `{ ok, uptime, version, sessions: [{ schoolId, status, lastActivity }] }` — gate the session list behind auth (don't leak phone numbers / school IDs publicly). Two health endpoints (`/health` minimal public, `/health/detail` authenticated) is fine.
@@ -94,7 +133,7 @@ The README has the full step-by-step. This is the operator's checklist.
 
 ---
 
-## 6. Out of scope
+## 7. Out of scope
 
 Things that have come up and been explicitly ruled out — leave them ruled out unless the architecture changes:
 
@@ -107,7 +146,7 @@ Things that have come up and been explicitly ruled out — leave them ruled out 
 
 ---
 
-## 7. References
+## 8. References
 
 - `README.md` — repo layout, API surface, deploy runbook, schema-sync workflow.
 - `src/anti-ban.ts` — jitter + quiet hours.
