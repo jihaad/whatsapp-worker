@@ -19,7 +19,7 @@ import { prisma } from './prisma';
 export type SessionStatus = 'disconnected' | 'connecting' | 'qr_pending' | 'ready';
 
 export interface SchoolSession {
-  schoolId: string;
+  sessionId: string;
   status: SessionStatus;
   qrDataUrl: string | null;
   phoneNumber: string | null;
@@ -365,12 +365,12 @@ export async function getSession(schoolId: string): Promise<SchoolSession | null
 
   // Restore in-flight — tell the caller to keep polling
   if (initializing.has(schoolId)) {
-    return { schoolId, status: 'connecting', qrDataUrl: null, phoneNumber: null, lastActivity: '' };
+    return { sessionId: schoolId, status: 'connecting', qrDataUrl: null, phoneNumber: null, lastActivity: '' };
   }
 
   const hasSaved = await prisma.whatsAppSession.findUnique({ where: { schoolId }, select: { schoolId: true } });
   if (hasSaved) {
-    return { schoolId, status: 'disconnected', qrDataUrl: null, phoneNumber: null, lastActivity: '' };
+    return { sessionId: schoolId, status: 'disconnected', qrDataUrl: null, phoneNumber: null, lastActivity: '' };
   }
   return null;
 }
@@ -383,7 +383,7 @@ export async function getSession(schoolId: string): Promise<SchoolSession | null
  */
 export async function listSessions(): Promise<SchoolSession[]> {
   const live = Array.from(sessions.entries()).map(([id, m]) => toSchoolSession(id, m));
-  const liveIds = new Set(live.map((s) => s.schoolId));
+  const liveIds = new Set(live.map((s) => s.sessionId));
 
   const saved = await prisma.whatsAppSession.findMany({
     select: { schoolId: true, phoneNumber: true, updatedAt: true },
@@ -392,7 +392,7 @@ export async function listSessions(): Promise<SchoolSession[]> {
   const offline: SchoolSession[] = saved
     .filter((row) => !liveIds.has(row.schoolId))
     .map((row) => ({
-      schoolId: row.schoolId,
+      sessionId: row.schoolId,
       status: 'disconnected' as const,
       qrDataUrl: null,
       phoneNumber: row.phoneNumber,
@@ -454,8 +454,9 @@ export async function sendMessage(schoolId: string, to: string, body: string): P
 
     stage = 'sendMessage';
     const msg = await managed.client.sendMessage(numberId._serialized, body);
-    managed.lastActivity = new Date().toISOString();
-    return { success: true, messageId: msg.id?.id ?? null, recipientPhone: to, timestamp: new Date().toISOString() };
+    const timestamp = new Date().toISOString();
+    managed.lastActivity = timestamp;
+    return { success: true, messageId: msg.id?.id ?? null, recipientPhone: to, timestamp };
   } catch (error) {
     const stack = error instanceof Error ? error.stack : String(error);
     console.error(
@@ -476,7 +477,7 @@ export async function sendMessage(schoolId: string, to: string, body: string): P
 }
 
 function toSchoolSession(schoolId: string, m: ManagedSession): SchoolSession {
-  return { schoolId, status: m.status, qrDataUrl: m.qrDataUrl, phoneNumber: m.phoneNumber, lastActivity: m.lastActivity };
+  return { sessionId: schoolId, status: m.status, qrDataUrl: m.qrDataUrl, phoneNumber: m.phoneNumber, lastActivity: m.lastActivity };
 }
 
 /**
