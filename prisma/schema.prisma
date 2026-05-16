@@ -1,17 +1,15 @@
-// fd-whatsapp-worker — Prisma schema
+// whatsapp-worker — Prisma schema
 //
-// Slim, transport-only. The worker owns this single table; the FD app no
-// longer declares `WhatsAppSession` in its own schema.
+// Slim, transport-only. The worker owns only the tables declared below.
+// If a calling application maintains its own mirror of `WhatsAppSession`
+// (or a foreign-key to it), the two sides must match column-for-column;
+// changes here require coordination there.
 //
-// `schoolId` is treated as an opaque tenant identifier — the worker has
-// no concept of schools, classes, students, payments, or invoices. FD
-// hands the worker a UUID and a recipient phone; the worker maintains a
-// WhatsApp Web session per UUID and dispatches messages.
-//
-// **Schema sync rule:** the columns below must match FD's
-// `prisma/schema.prisma` `WhatsAppSession` model byte-for-byte (other
-// than the relation, which the worker doesn't have). Any change to either
-// side requires updating the other and running `npm run generate` here.
+// `schoolId` is the column name retained from the original use case but
+// is treated as an opaque tenant identifier — the worker has no concept
+// of what the UUID maps to in the caller's domain. The caller hands the
+// worker a UUID and a recipient phone; the worker maintains a WhatsApp
+// Web session per UUID and dispatches messages.
 
 generator client {
   provider = "prisma-client"
@@ -22,7 +20,8 @@ datasource db {
   provider = "postgresql"
 }
 
-/// One row per linked school. The actual whatsapp-web.js session profile
+/// One row per linked session (`schoolId` is the legacy column name —
+/// treat it as an opaque tenant UUID). The actual whatsapp-web.js session profile
 /// (a tar.gz of the LocalAuth Chromium user-data dir) lives in
 /// `sessionData`. Status is computed at runtime by the worker's in-memory
 /// session manager and surfaced via the worker's HTTP API — it is NOT
@@ -36,4 +35,64 @@ model WhatsAppSession {
   updatedAt   DateTime @updatedAt
 
   @@map("whatsapp_sessions")
+}
+
+/// Bulk-send batches. Persisted so the GET poll endpoint survives a worker
+/// restart. `results` is JSONB so the send loop can atomically append entries
+/// with `results || $1::jsonb`.
+///
+/// `status`:
+///   - 'processing'  — send loop is alive. If a row is found in this state
+///                     on boot, the loop's process is dead and the row is
+///                     transitioned to 'interrupted' by
+///                     markInterruptedBatches().
+///   - 'complete'    — loop finished normally.
+///   - 'interrupted' — process died mid-batch. The caller should re-enqueue any
+///                     unsent items; its `notification_logs` uniqueness
+///                     constraint is the safety net against duplicates.
+///
+/// Rows are evicted 24 h after completion (see deleteOldBatches in
+/// src/routes/messages.ts) — bulk batches are operational state, not history.
+model WhatsAppBulkBatch {
+  batchId     String    @id @db.Uuid
+  sessionId   String    @db.Uuid
+  status      String
+  total       Int
+  succeeded   Int       @default(0)
+  failed      Int       @default(0)
+  results     Json      @default("[]")
+  startedAt   DateTime
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([sessionId])
+  @@index([createdAt])
+  @@map("whatsapp_bulk_batches")
+}
+
+/// Append-only log of every send / failure / bulk milestone. Powers the
+/// dashboard's message feed across worker restarts and dashboard reloads.
+///
+/// Distinct from pino logs (stdout / aggregator) and the in-memory ring
+/// buffer in `src/events.ts` (process-lifetime only). 7-day retention; older
+/// rows are deleted by the periodic sweep in `src/lib/event-persistence.ts`.
+///
+/// `type` mirrors WorkerEventType (`message.sent`, `message.failed`,
+/// `bulk.started`, `bulk.completed`). `data` is the full JSON payload as
+/// emitted by the eventBus, kept as a fallback so the schema can evolve
+/// without breaking older rows.
+model WhatsAppMessageEvent {
+  id        BigInt   @id @default(autoincrement())
+  ts        DateTime @default(now())
+  type      String
+  sessionId String?  @db.Uuid
+  recipient String?
+  messageId String?
+  batchId   String?  @db.Uuid
+  error     String?
+  data      Json     @default("{}")
+
+  @@index([ts(sort: Desc)])
+  @@index([sessionId])
+  @@map("whatsapp_message_events")
 }

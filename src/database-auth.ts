@@ -4,6 +4,9 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { readFile, writeFile, rm, cp } from 'node:fs/promises';
 import { create, extract } from 'tar';
 import { prisma } from './prisma';
+import { logger } from './logger';
+
+const log = logger.child({ component: 'database-auth' });
 
 /**
  * Chromium cache directories that bloat a long-running session profile but
@@ -77,9 +80,9 @@ async function rmrf(path: string, attempts = 5): Promise<void> {
  * launches we extract the blob to the local session folder; after ready we
  * upload the folder back to the DB.
  *
- * **Pure-API note:** this class only writes to its own table. It does NOT
- * touch any FD domain table (no `school.whatsappLinked` flag updates). The
- * worker reports session state via the HTTP API; FD reads it from there.
+ * **Pure-API note:** this class only writes to the worker's own table. It
+ * never touches any other tables that might share the database. Callers
+ * track their own linked-status flags by polling the worker's HTTP API.
  */
 export class DatabaseAuth extends LocalAuth {
   private readonly schoolId: string;
@@ -125,7 +128,7 @@ export class DatabaseAuth extends LocalAuth {
         select: { sessionData: true },
       });
       if (!saved?.sessionData) {
-        console.log(`[DatabaseAuth] no saved session blob for ${this.schoolId} — fresh link flow`);
+        log.debug({ schoolId: this.schoolId }, 'no saved session blob — fresh link flow');
         return;
       }
 
@@ -136,7 +139,10 @@ export class DatabaseAuth extends LocalAuth {
       await writeFile(tmpTar, Buffer.from(saved.sessionData));
       try {
         await extract({ file: tmpTar, cwd: this.resolvedDataPath });
-        console.log(`[DatabaseAuth] restored ${Buffer.from(saved.sessionData).length} bytes → ${sessionDir}`);
+        log.info(
+          { schoolId: this.schoolId, bytes: Buffer.from(saved.sessionData).length, sessionDir },
+          'restored session blob',
+        );
       } finally {
         await rm(tmpTar, { force: true });
       }
@@ -145,8 +151,8 @@ export class DatabaseAuth extends LocalAuth {
       for (const lock of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
         await rm(join(sessionDir, lock), { force: true });
       }
-    } catch (e) {
-      console.error(`[DatabaseAuth] restore failed for ${this.schoolId}:`, e);
+    } catch (err) {
+      log.error({ err, schoolId: this.schoolId }, 'restore failed');
     }
   }
 
@@ -174,17 +180,20 @@ export class DatabaseAuth extends LocalAuth {
         [sessionDirName],
       );
       const blob = await readFile(tmpTar);
-      console.log(`[DatabaseAuth] persisting ${this.schoolId}: ${(blob.byteLength / 1024 / 1024).toFixed(1)}MB`);
+      log.info(
+        { schoolId: this.schoolId, sizeMb: Number((blob.byteLength / 1024 / 1024).toFixed(1)) },
+        'persisting session',
+      );
 
-      // Only the worker's own table is touched. FD's `school.whatsapp*`
-      // columns are FD's responsibility — it polls the worker API and
-      // updates them on its side.
+      // Only the worker's own table is touched. Any caller-side
+      // "linked phone" or "last seen" columns are the caller's responsibility
+      // — they poll the worker's HTTP API and update their own state.
       await prisma.whatsAppSession.upsert({
         where: { schoolId: this.schoolId },
         create: { schoolId: this.schoolId, sessionData: blob, phoneNumber: phoneNumber ?? null },
         update: { sessionData: blob, ...(phoneNumber ? { phoneNumber } : {}) },
       });
-      console.log(`[DatabaseAuth] session persisted for ${this.schoolId}`);
+      log.info({ schoolId: this.schoolId }, 'session persisted');
     } finally {
       await rm(tmpTar, { force: true });
       await rmrf(snapshotRoot);

@@ -1,22 +1,22 @@
 [Unit]
-Description=Fududeeye WhatsApp Worker (pure-API)
+Description=WhatsApp Worker (pure-API)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=fdworker
-WorkingDirectory=/home/fdworker/app
+User=wa-worker
+WorkingDirectory=/home/wa-worker/app
 ExecStart=/usr/bin/node --enable-source-maps --import tsx src/index.ts
 Restart=on-failure
 RestartSec=5
-StandardOutput=append:/var/log/fd-worker/worker.log
-StandardError=append:/var/log/fd-worker/worker.log
+StandardOutput=append:/var/log/wa-worker/worker.log
+StandardError=append:/var/log/wa-worker/worker.log
 
 # --- Security hardening ---
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/home/fdworker/app /var/lib/fd-worker /var/log/fd-worker
+ReadWritePaths=/home/wa-worker/app /var/lib/wa-worker /var/log/wa-worker
 PrivateTmp=yes
 ProtectHome=read-only
 ProtectKernelTunables=yes

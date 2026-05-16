@@ -1,8 +1,8 @@
 {
-  "name": "fd-whatsapp-worker",
+  "name": "whatsapp-worker",
   "version": "0.1.0",
   "private": true,
-  "description": "Pure-API WhatsApp Web worker for Fududeeye Waxbarasho. Transport-only — owns whatsapp_sessions in Supabase, exposes HTTPS endpoints (link, status, send) for the FD app to call. No FD domain knowledge.",
+  "description": "Pure-API WhatsApp Web worker. Transport-only — owns its own session storage in Postgres, exposes HTTPS endpoints (link, status, send) for any caller. No domain knowledge beyond an opaque sessionId.",
   "engines": {
     "node": ">=20.6.0"
   },
@@ -16,10 +16,11 @@
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
     "@scalar/express-api-reference": "^0.8.48",
-    "@types/morgan": "^1.9.10",
     "express": "^4.22.1",
-    "morgan": "^1.10.1",
+    "express-rate-limit": "^8.5.2",
     "pg": "^8.20.0",
+    "pino": "^10.3.1",
+    "pino-http": "^11.0.0",
     "prom-client": "^15.1.3",
     "qrcode": "^1.5.4",
     "tar": "^7.5.13",
@@ -31,6 +32,7 @@
     "@types/pg": "^8.20.0",
     "@types/qrcode": "^1.5.6",
     "@types/tar": "^6.1.13",
+    "pino-pretty": "^13.1.3",
     "prisma": "^7.8.0",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"

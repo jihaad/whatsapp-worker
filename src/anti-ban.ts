@@ -1,22 +1,23 @@
 /**
  * Anti-ban helpers — applied per-request inside `POST /messages/send`.
  *
- * Inherited from the old queue-drain loop in `dispatch.ts` (FD-side, since
- * removed). The worker is now pure-API: there's no internal queue, FD's
- * cron POSTs each due reminder one at a time. These helpers run inline.
+ * The worker is pure-API: there's no internal queue. Callers POST one
+ * message at a time (or use `/messages/send-bulk` for batched dispatch),
+ * and these helpers run inline before whatsapp-web.js sees the request.
  *
  * What they do:
  *
  *   - **Quiet hours** — reject the request with HTTP 503 + `Retry-After`
- *     when local time is outside 07:00–21:00 EAT. FD's cron is expected
- *     to retry on the next tick.
+ *     when local time is outside the configured window (default
+ *     07:00–21:00 in `QUIET_HOUR_TZ`). Callers are expected to retry
+ *     after the supplied delay.
  *
  *   - **Randomised jitter** — wait 5–15s before invoking whatsapp-web.js's
- *     `sendMessage`, so the gap between consecutive sends from FD's cron
- *     loop has natural variance. Worst-case throughput ~6 msg/min, well
- *     under WhatsApp Web's safe rate.
+ *     `sendMessage`, so the gap between consecutive sends has natural
+ *     variance. Worst-case throughput ~6 msg/min, well under WhatsApp
+ *     Web's safe rate.
  *
- * Both are part of WAHA's basic anti-ban posture. Caller composes them in
+ * Both are part of the basic anti-ban posture. The route composes them in
  * order: quiet-hours guard first (fail fast), then await the jitter, then
  * call `sendMessage`.
  */

@@ -1,17 +1,29 @@
 import { Router } from 'express';
-import { initSession, getSession, listSessions, destroySession, sendMessage } from '../sessions';
-import { sleepJitter } from '../anti-ban';
-import { quietHoursGuard } from '../middleware/quiet-hours';
+import { z } from 'zod';
+import { initSession, getSession, listSessions, destroySession } from '../sessions';
+import { sendError } from '../lib/errors';
 
 const router = Router();
 
-router.get('/', async (_req, res) => {
+const ListSessionsQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  cursor: z.string().min(1).optional(),
+});
+
+router.get('/', async (req, res) => {
+  const parsed = ListSessionsQuery.safeParse(req.query);
+  if (!parsed.success) {
+    sendError(req, res, 400, 'BAD_REQUEST', 'Invalid query', { details: parsed.error.issues });
+    return;
+  }
+  const limit = parsed.data.limit ?? 50;
+
   try {
-    const sessions = await listSessions();
-    res.json({ sessions });
+    const result = await listSessions({ limit, cursor: parsed.data.cursor });
+    res.json(result);
   } catch (err) {
-    console.error('[worker] GET /sessions:', err);
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to list sessions' });
+    req.log.error({ err }, 'GET /sessions failed');
+    sendError(req, res, 500, 'INTERNAL', 'Failed to list sessions');
   }
 });
 
@@ -20,8 +32,8 @@ router.post('/:sessionId', async (req, res) => {
     const session = await initSession(req.params.sessionId);
     res.json({ session });
   } catch (err) {
-    console.error(`[worker] POST /sessions/${req.params.sessionId}:`, err);
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to init session' });
+    req.log.error({ err, sessionId: req.params.sessionId }, 'POST /sessions/:sessionId failed');
+    sendError(req, res, 500, 'INTERNAL', 'Failed to init session');
   }
 });
 
@@ -30,37 +42,18 @@ router.get('/:sessionId', async (req, res) => {
     const session = await getSession(req.params.sessionId);
     res.json({ session });
   } catch (err) {
-    console.error(`[worker] GET /sessions/${req.params.sessionId}:`, err);
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to get session' });
+    req.log.error({ err, sessionId: req.params.sessionId }, 'GET /sessions/:sessionId failed');
+    sendError(req, res, 500, 'INTERNAL', 'Failed to get session');
   }
 });
 
 router.delete('/:sessionId', async (req, res) => {
   try {
     await destroySession(req.params.sessionId);
-    res.json({ success: true });
+    res.json({ sessionId: req.params.sessionId });
   } catch (err) {
-    console.error(`[worker] DELETE /sessions/${req.params.sessionId}:`, err);
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to destroy session' });
-  }
-});
-
-// Legacy alias — remove once FD's client.ts calls /messages/send instead.
-router.post('/:sessionId/send', quietHoursGuard, async (req, res) => {
-  const schoolId = req.params.sessionId as string;
-  const { to, body } = req.body as { to?: string; body?: string };
-  if (!to || !body) {
-    res.status(400).json({ error: '`to` and `body` are required' });
-    return;
-  }
-
-  try {
-    await sleepJitter();
-    const result = await sendMessage(schoolId, to, body);
-    res.status(result.success ? 200 : 502).json(result);
-  } catch (err) {
-    console.error(`[worker] POST /sessions/${schoolId}/send:`, err);
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to send message' });
+    req.log.error({ err, sessionId: req.params.sessionId }, 'DELETE /sessions/:sessionId failed');
+    sendError(req, res, 500, 'INTERNAL', 'Failed to destroy session');
   }
 });
 

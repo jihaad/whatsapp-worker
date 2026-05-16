@@ -1,4 +1,4 @@
-# Cloudflare Tunnel config for fd-whatsapp-worker.
+# Cloudflare Tunnel config for whatsapp-worker.
 #
 # --- Quick tunnel (testing, no account needed) ---
 #   cloudflared tunnel --url http://localhost:3001
@@ -6,17 +6,17 @@
 #
 # --- Named tunnel (production, requires Cloudflare account) ---
 #   cloudflared tunnel login
-#   cloudflared tunnel create fd-worker          # saves credentials JSON + prints UUID
+#   cloudflared tunnel create whatsapp-worker     # saves credentials JSON + prints UUID
 #   Update credentials-file below with the UUID, then:
 #   sudo cp deploy/cloudflared.config.yml /etc/cloudflared/config.yml
 #   sudo cloudflared service install
 #
 # The tunnel is reachable at https://<tunnel-id>.cfargotunnel.com once running.
 # To use a custom domain later:
-#   cloudflared tunnel route dns fd-worker <your-hostname>
+#   cloudflared tunnel route dns whatsapp-worker <your-hostname>
 #   Add a hostname block to ingress below.
 
-tunnel: fd-worker
+tunnel: whatsapp-worker
 credentials-file: /etc/cloudflared/<tunnel-id>.json
 
 ingress:

@@ -1,9 +1,10 @@
 import type { RequestHandler } from 'express';
 import { isQuietHour, secondsUntilNextSendWindow, QUIET_HOURS_MESSAGE } from '../anti-ban';
+import { sendError } from '../lib/errors';
 
-export const quietHoursGuard: RequestHandler = (_req, res, next) => {
+export const quietHoursGuard: RequestHandler = (req, res, next) => {
   if (!isQuietHour()) return next();
-  const retryAfter = secondsUntilNextSendWindow();
-  res.set('Retry-After', String(retryAfter));
-  res.status(503).json({ error: QUIET_HOURS_MESSAGE, code: 'QUIET_HOURS', retryAfter });
+  sendError(req, res, 503, 'QUIET_HOURS', QUIET_HOURS_MESSAGE, {
+    retryAfter: secondsUntilNextSendWindow(),
+  });
 };

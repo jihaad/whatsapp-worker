@@ -2,14 +2,19 @@ import { Client } from 'whatsapp-web.js';
 import * as QRCode from 'qrcode';
 import { DatabaseAuth } from './database-auth';
 import { prisma } from './prisma';
+import { logger } from './logger';
+import { eventBus } from './events';
+import { checkRecipientCooldown, consumeRateTokens, recordRecipientSend, forgetAccount } from './lib/messaging-limits';
+import { varyBody } from './lib/body-variation';
 
 /**
  * Long-lived session manager for the WhatsApp worker process.
  *
  * The worker is the **transport layer** — it knows about WhatsApp Web
- * sessions keyed by an opaque `schoolId` UUID, nothing else. No knowledge
- * of FD's domain models (schools, students, classes, invoices, payments).
- * FD reports the linked status to its UI by polling the worker's HTTP API.
+ * sessions keyed by an opaque UUID (`schoolId` in code for historical
+ * reasons; treat it as an arbitrary tenant identifier). No knowledge of
+ * the calling application's domain models. Callers track linked status
+ * for their own UI by polling the worker's HTTP API.
  *
  * Session blobs persist in `whatsapp_sessions.sessionData` as tar.gz —
  * Chromium restores from the DB on worker startup without requiring a new
@@ -32,6 +37,10 @@ export interface SendMessageResult {
   recipientPhone: string;
   error?: string;
   timestamp: string;
+  // Populated when the send was blocked by a messaging-layer rate limit
+  // (recipient cooldown, per-account / global / warmup). The route handler
+  // checks for this and maps to HTTP 429 with the standard error envelope.
+  rateLimit?: { code: 'RECIPIENT_COOLDOWN' | 'ACCOUNT_RATE_LIMIT' | 'WARMUP_LIMIT' | 'GLOBAL_RATE_LIMIT'; retryAfter: number };
 }
 
 interface ManagedSession {
@@ -107,6 +116,8 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
     return toSchoolSession(schoolId, existing);
   }
 
+  eventBus.publish('session.init', { sessionId: schoolId, isRestore });
+  const log = logger.child({ schoolId });
   const auth = new DatabaseAuth({ clientId: schoolId, dataPath: getSessionDir() });
   const initStart = Date.now();
   const client = new Client({
@@ -158,11 +169,12 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
       managed.qrDataUrl = await QRCode.toDataURL(qr, { width: 300, margin: 2 });
       managed.status = 'qr_pending';
       managed.lastActivity = new Date().toISOString();
-      console.log(`[worker] QR ready for ${schoolId} in ${Date.now() - initStart}ms`);
+      log.info({ elapsedMs: Date.now() - initStart }, 'qr ready');
+      eventBus.publish('session.qr', { sessionId: schoolId, elapsedMs: Date.now() - initStart });
 
       if (isRestore && !qrSeen) {
         qrSeen = true;
-        console.warn(`[worker] restore rejected by WhatsApp for ${schoolId} — dropping stale blob`);
+        log.warn('restore rejected by WhatsApp — dropping stale blob');
         await prisma.whatsAppSession.delete({ where: { schoolId } }).catch(() => {});
       }
     } catch {
@@ -176,7 +188,8 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
     managed.lastActivity = new Date().toISOString();
     const info = client.info;
     if (info?.wid?.user) managed.phoneNumber = info.wid.user;
-    console.log(`[worker] Session ready for ${schoolId} (${managed.phoneNumber ?? 'unknown'})`);
+    log.info({ phoneNumber: managed.phoneNumber }, 'session ready');
+    eventBus.publish('session.ready', { sessionId: schoolId, phoneNumber: managed.phoneNumber });
 
     // Wait for Chromium to flush IndexedDB to disk before taring the session.
     // 20s gives the initial WhatsApp history sync room to land before we
@@ -186,31 +199,46 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
     // settled Chromium (see persistAndDestroyAll below).
     await new Promise((r) => setTimeout(r, 20000));
 
-    await auth.persistToDatabase(managed.phoneNumber ?? undefined).catch((e) => {
-      console.error(`[worker] persist on ready failed for ${schoolId}:`, e);
+    await auth.persistToDatabase(managed.phoneNumber ?? undefined).catch((err) => {
+      log.error({ err }, 'persist on ready failed');
     });
   });
 
   client.on('authenticated', () => {
-    console.log(`[worker] authenticated ${schoolId}`);
+    log.info('authenticated');
+    eventBus.publish('session.authenticated', { sessionId: schoolId });
     managed.status = 'connecting';
     managed.lastActivity = new Date().toISOString();
   });
 
   client.on('loading_screen', (pct: number, msg: string) => {
-    console.log(`[worker] loading ${schoolId}: ${pct}% ${msg}`);
+    log.debug({ pct, msg }, 'loading');
   });
 
   client.on('disconnected', (reason) => {
-    console.log(`[worker] Session disconnected for ${schoolId}:`, reason);
+    log.info({ reason }, 'session disconnected');
+    eventBus.publish('session.disconnected', { sessionId: schoolId, reason: String(reason) });
     managed.status = 'disconnected';
     managed.qrDataUrl = null;
     managed.lastActivity = new Date().toISOString();
     sessions.delete(schoolId);
   });
 
+  // Best-effort read receipts. WhatsApp engagement scoring rewards accounts
+  // whose user actually reads incoming messages — silent inboxes look bot-y.
+  // Non-fatal: any failure here is logged at debug and the worker continues.
+  client.on('message', async (msg) => {
+    try {
+      const chat = await msg.getChat();
+      await chat.sendSeen();
+    } catch (err) {
+      log.debug({ err }, 'sendSeen failed (non-fatal)');
+    }
+  });
+
   client.on('auth_failure', (msg) => {
-    console.error(`[worker] Auth failure for ${schoolId}:`, msg);
+    log.error({ msg }, 'auth failure');
+    eventBus.publish('session.auth_failure', { sessionId: schoolId, reason: String(msg) });
     managed.status = 'disconnected';
     managed.qrDataUrl = null;
     sessions.delete(schoolId);
@@ -222,7 +250,7 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
   // just return the `connecting` session immediately and let the poll pick
   // up the QR the moment it's emitted.
   tryInitialize(client, schoolId).catch((err) => {
-    console.error(`[worker] init failed for ${schoolId}:`, err);
+    log.error({ err }, 'init failed');
     sessions.delete(schoolId);
     client.destroy().catch(() => {});
   });
@@ -235,11 +263,11 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
  * Fires each initSession() in the background so the worker HTTP server
  * is available immediately while Chromium boots in the background.
  *
- * **Pure-API note:** this used to filter by `school.user.deletedAt` to
- * skip sessions for soft-deleted schools. The worker no longer has that
- * cross-table knowledge; it trusts `whatsapp_sessions` as the source of
- * truth. FD is responsible for calling `DELETE /sessions/:schoolId` when
- * a school is soft-deleted so the row is cleaned up here too.
+ * **Pure-API note:** the worker has no cross-table knowledge of the
+ * calling application's domain. It trusts `whatsapp_sessions` as the
+ * source of truth for what to restore. Callers are responsible for
+ * issuing `DELETE /v1/sessions/:sessionId` when a tenant is removed on
+ * their side, so the row is cleaned up here too.
  */
 export async function restoreSessions(): Promise<void> {
   const ids = new Set<string>();
@@ -260,8 +288,8 @@ export async function restoreSessions(): Promise<void> {
       for (const row of saved) ids.add(row.schoolId);
 
       // Also pick up any local session folders left by a previous run.
-      // Without cross-table knowledge of FD's School table, we trust the
-      // disk match for any UUID-shaped folder name — the next boot can
+      // Without cross-table knowledge of the caller's tenant list, we trust
+      // the disk match for any UUID-shaped folder name — the next boot can
       // still emit a fresh QR if WhatsApp rejects it, at which point the
       // row gets dropped (see initSession's `isRestore` path).
       try {
@@ -275,24 +303,23 @@ export async function restoreSessions(): Promise<void> {
       } catch { /* FS scan is best-effort */ }
       break; // success — fall through to the fan-out
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
       if (attempt >= MAX_ATTEMPTS) {
-        console.error(
-          `[worker] restoreSessions giving up after ${attempt} attempts — the worker will serve link/QR flows but not auto-restore. Last error:`,
-          msg,
+        logger.error(
+          { err, attempts: attempt },
+          'restoreSessions giving up — worker will serve link/QR flows but not auto-restore',
         );
         return;
       }
       const delay = Math.min(15000, 1000 * 2 ** (attempt - 1));
-      console.warn(
-        `[worker] restoreSessions DB read failed (attempt ${attempt}/${MAX_ATTEMPTS}) — retrying in ${delay}ms. Error:`,
-        msg,
+      logger.warn(
+        { err, attempt, maxAttempts: MAX_ATTEMPTS, retryInMs: delay },
+        'restoreSessions DB read failed — retrying',
       );
       await new Promise((r) => setTimeout(r, delay));
     }
   }
 
-  console.log(`[worker] Restoring ${ids.size} session(s) in background…`);
+  logger.info({ count: ids.size }, 'restoring sessions in background');
 
   for (const schoolId of ids) {
     if (sessions.has(schoolId) || initializing.has(schoolId)) continue;
@@ -300,7 +327,7 @@ export async function restoreSessions(): Promise<void> {
     initializing.add(schoolId);
     initSession(schoolId, /* isRestore */ true)
       .catch((err) => {
-        console.error(`[worker] failed to restore ${schoolId}:`, err);
+        logger.error({ err, schoolId }, 'failed to restore session');
         sessions.delete(schoolId);
       })
       .finally(() => initializing.delete(schoolId));
@@ -322,15 +349,16 @@ export async function persistAndDestroyAll(timeoutMs = 30_000): Promise<void> {
   const entries = Array.from(sessions.entries());
   if (entries.length === 0) return;
 
-  console.log(`[worker] shutdown: closing ${entries.length} session(s) cleanly…`);
+  logger.info({ count: entries.length }, 'shutdown: closing sessions cleanly');
   const deadline = Date.now() + timeoutMs;
 
   // Sequential: concurrent tars would thrash disk and each one is already
   // heavy (copy + gzip of ~30-80 MB).
   for (const [schoolId, managed] of entries) {
+    const log = logger.child({ schoolId });
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      console.warn(`[worker] shutdown: out of time, skipping ${schoolId}`);
+      log.warn('shutdown: out of time, skipping');
       continue;
     }
 
@@ -341,16 +369,16 @@ export async function persistAndDestroyAll(timeoutMs = 30_000): Promise<void> {
         await Promise.race([
           managed.client.destroy(),
           new Promise((_, rej) => setTimeout(() => rej(new Error('destroy timeout')), Math.min(remaining, 15_000))),
-        ]).catch((e) => console.warn(`[worker] shutdown: destroy error for ${schoolId}:`, e));
+        ]).catch((err) => log.warn({ err }, 'shutdown: destroy error'));
 
         await managed.auth.persistToDatabase(managed.phoneNumber ?? undefined);
-        console.log(`[worker] shutdown: persisted ${schoolId}`);
+        log.info('shutdown: persisted');
       } else {
         // Non-ready sessions have nothing worth keeping — just close.
         await managed.client.destroy().catch(() => {});
       }
-    } catch (e) {
-      console.error(`[worker] shutdown: persist failed for ${schoolId}:`, e);
+    } catch (err) {
+      log.error({ err }, 'shutdown: persist failed');
     } finally {
       sessions.delete(schoolId);
     }
@@ -376,12 +404,35 @@ export async function getSession(schoolId: string): Promise<SchoolSession | null
 }
 
 /**
- * List every session the worker currently knows about — used by FD to
- * render its dashboards/sidebars without storing a denormalised
- * `school.whatsappLinked` flag. Returns sessions for both in-memory
- * (live) and saved-only (disconnected since restart) states.
+ * Opaque pagination cursor — base64url JSON pointing at the last sessionId
+ * already returned. Cursor-based (not offset) so inserts/deletes don't shift
+ * pages under the caller.
  */
-export async function listSessions(): Promise<SchoolSession[]> {
+interface PageCursor { lastSessionId: string }
+export function encodeCursor(c: PageCursor): string {
+  return Buffer.from(JSON.stringify(c)).toString('base64url');
+}
+export function decodeCursor(s: string): PageCursor | null {
+  try {
+    const parsed = JSON.parse(Buffer.from(s, 'base64url').toString()) as Partial<PageCursor>;
+    return typeof parsed.lastSessionId === 'string' ? { lastSessionId: parsed.lastSessionId } : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface ListSessionsResult {
+  sessions: SchoolSession[];
+  nextCursor: string | null;
+}
+
+/**
+ * List sessions (paginated). Lets a caller render its dashboards without
+ * storing a denormalised "linked" flag on its side. Merges in-memory
+ * (live) sessions and saved-only (disconnected since restart) sessions,
+ * sorted by sessionId ascending so pagination is stable.
+ */
+export async function listSessions(opts: { limit: number; cursor?: string } = { limit: 50 }): Promise<ListSessionsResult> {
   const live = Array.from(sessions.entries()).map(([id, m]) => toSchoolSession(id, m));
   const liveIds = new Set(live.map((s) => s.sessionId));
 
@@ -399,7 +450,25 @@ export async function listSessions(): Promise<SchoolSession[]> {
       lastActivity: row.updatedAt.toISOString(),
     }));
 
-  return [...live, ...offline];
+  const all = [...live, ...offline].sort((a, b) => a.sessionId.localeCompare(b.sessionId));
+
+  let startIdx = 0;
+  if (opts.cursor) {
+    const decoded = decodeCursor(opts.cursor);
+    if (decoded) {
+      // findIndex returns first session whose sessionId > cursor.lastSessionId
+      startIdx = all.findIndex((s) => s.sessionId > decoded.lastSessionId);
+      if (startIdx === -1) startIdx = all.length;
+    }
+  }
+
+  const page = all.slice(startIdx, startIdx + opts.limit);
+  const hasMore = startIdx + opts.limit < all.length;
+  const nextCursor = hasMore && page.length > 0
+    ? encodeCursor({ lastSessionId: page[page.length - 1]!.sessionId })
+    : null;
+
+  return { sessions: page, nextCursor };
 }
 
 export async function destroySession(schoolId: string): Promise<void> {
@@ -410,10 +479,15 @@ export async function destroySession(schoolId: string): Promise<void> {
     sessions.delete(schoolId);
   }
   try { await prisma.whatsAppSession.delete({ where: { schoolId } }); } catch { /* may not exist */ }
+  // Drop the cached linkedAt + token bucket so a re-link restarts the
+  // warmup curve from day 1.
+  forgetAccount(schoolId);
+  eventBus.publish('session.deleted', { sessionId: schoolId });
 }
 
 export async function sendMessage(schoolId: string, to: string, body: string): Promise<SendMessageResult> {
   const managed = sessions.get(schoolId);
+  const log = logger.child({ schoolId });
 
   if (!managed || managed.status !== 'ready') {
     return {
@@ -421,6 +495,34 @@ export async function sendMessage(schoolId: string, to: string, body: string): P
       messageId: null,
       recipientPhone: to,
       error: managed ? `Session not ready (${managed.status})` : 'No active session — link WhatsApp first.',
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  // Messaging-layer rate limits — recipient cooldown, then per-account
+  // (warmup-aware) + global token buckets. Bulk batches loop through this
+  // same path so coverage is automatic across single + bulk sends.
+  const cooldown = checkRecipientCooldown(to);
+  if (!cooldown.ok) {
+    log.warn({ to, retryAfter: cooldown.retryAfter }, 'recipient cooldown — skipping send');
+    return {
+      success: false,
+      messageId: null,
+      recipientPhone: to,
+      error: cooldown.message,
+      rateLimit: { code: cooldown.code, retryAfter: cooldown.retryAfter },
+      timestamp: new Date().toISOString(),
+    };
+  }
+  const tokens = await consumeRateTokens(schoolId);
+  if (!tokens.ok) {
+    log.warn({ to, code: tokens.code, retryAfter: tokens.retryAfter }, 'messaging-layer rate limit — skipping send');
+    return {
+      success: false,
+      messageId: null,
+      recipientPhone: to,
+      error: tokens.message,
+      rateLimit: { code: tokens.code, retryAfter: tokens.retryAfter },
       timestamp: new Date().toISOString(),
     };
   }
@@ -434,15 +536,15 @@ export async function sendMessage(schoolId: string, to: string, body: string): P
     let numberId: { _serialized: string } | null = null;
     try {
       numberId = await managed.client.getNumberId(chatId);
-    } catch (e) {
+    } catch (err) {
       // getNumberId errors aren't fatal — fall through to the raw sendMessage
       // attempt, which might still succeed. Log so we can see what's breaking.
-      console.error(`[worker] getNumberId threw for ${schoolId} → ${chatId}:`, e, (e as Error)?.stack);
+      log.error({ err, chatId }, 'getNumberId threw');
       numberId = null;
     }
 
     if (!numberId) {
-      console.warn(`[worker] send to ${schoolId}: ${to} (${chatId}) is not a WhatsApp user (or getNumberId threw — see above)`);
+      log.warn({ to, chatId }, 'send target not a WhatsApp user (or getNumberId threw — see above)');
       return {
         success: false,
         messageId: null,
@@ -453,16 +555,26 @@ export async function sendMessage(schoolId: string, to: string, body: string): P
     }
 
     stage = 'sendMessage';
-    const msg = await managed.client.sendMessage(numberId._serialized, body);
+    // Typing indicator + 1–2 s pause makes the worker behave more like a
+    // human keyboard, feeding WhatsApp's engagement score. Best-effort —
+    // failures here are non-fatal; the actual sendMessage still runs.
+    try {
+      const chat = await managed.client.getChatById(numberId._serialized);
+      await chat.sendStateTyping();
+      await new Promise((r) => setTimeout(r, 1000 + Math.floor(Math.random() * 1000)));
+      await chat.clearState();
+    } catch (e) {
+      log.debug({ err: e }, 'typing indicator failed (non-fatal)');
+    }
+
+    const msg = await managed.client.sendMessage(numberId._serialized, varyBody(body));
     const timestamp = new Date().toISOString();
     managed.lastActivity = timestamp;
+    recordRecipientSend(to);
     return { success: true, messageId: msg.id?.id ?? null, recipientPhone: to, timestamp };
-  } catch (error) {
-    const stack = error instanceof Error ? error.stack : String(error);
-    console.error(
-      `[worker] sendMessage failed at stage=${stage} for ${schoolId} → ${to} (${chatId}):\n${stack}`,
-    );
-    const rawMessage = error instanceof Error ? error.message : String(error);
+  } catch (err) {
+    log.error({ err, stage, to, chatId }, 'sendMessage failed');
+    const rawMessage = err instanceof Error ? err.message : String(err);
     const friendly = rawMessage && rawMessage.length > 2
       ? rawMessage
       : `Send failed (raw="${rawMessage}") — phone may not be on WhatsApp or session is stale`;

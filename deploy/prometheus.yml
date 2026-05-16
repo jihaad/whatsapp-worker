@@ -2,7 +2,7 @@ global:
   scrape_interval: 15s
 
 scrape_configs:
-  - job_name: fd-whatsapp-worker
+  - job_name: whatsapp-worker
     static_configs:
       - targets: ['worker:3001']
     metrics_path: /metrics

@@ -1,12 +1,18 @@
 import express from 'express';
-import morgan from 'morgan';
+import pinoHttp from 'pino-http';
+import { logger } from './logger';
 import { restoreSessions, persistAndDestroyAll } from './sessions';
 import { authMiddleware } from './middleware/auth';
+import { globalLimiter } from './lib/rate-limit';
+import { markInterruptedBatches, startBulkBatchEviction } from './lib/bulk-batch-maintenance';
+import { startEventPersistence } from './lib/event-persistence';
 import { registry } from './metrics';
 import healthRouter from './routes/health';
 import docsRouter from './routes/docs';
 import sessionsRouter from './routes/sessions';
 import messagesRouter from './routes/messages';
+import eventsRouter from './routes/events';
+import dashboardRouter from './routes/dashboard';
 
 // whatsapp-web.js fires async `framenavigated` events without try/catch. When
 // WhatsApp Web navigates mid-inject, Puppeteer throws "Execution context was
@@ -24,31 +30,75 @@ const isTransientPuppeteerError = (msg: string) =>
 process.on('unhandledRejection', (reason) => {
   const msg = reason instanceof Error ? reason.message : String(reason);
   if (isTransientPuppeteerError(msg)) {
-    console.warn('[worker] swallowed transient puppeteer rejection:', msg);
+    logger.warn({ msg }, 'swallowed transient puppeteer rejection');
     return;
   }
-  console.error('[worker] unhandledRejection:', reason);
+  logger.error({ err: reason }, 'unhandledRejection');
 });
 
 process.on('uncaughtException', (err) => {
   const msg = err instanceof Error ? err.message : String(err);
   if (isTransientPuppeteerError(msg)) {
-    console.warn('[worker] swallowed transient puppeteer exception:', msg);
+    logger.warn({ msg }, 'swallowed transient puppeteer exception');
     return;
   }
-  console.error('[worker] uncaughtException:', err);
+  logger.fatal({ err }, 'uncaughtException');
   process.exit(1);
 });
 
 const app = express();
-app.use(morgan('[:date[clf]] :method :url :status :response-time ms'));
+app.use(pinoHttp({
+  logger,
+  autoLogging: {
+    ignore: (req) =>
+      req.url === '/health' ||
+      req.url === '/health/ready' ||
+      req.url === '/metrics' ||
+      req.url === '/events' ||
+      req.url === '/dashboard' ||
+      (req.url ?? '').startsWith('/dashboard/'),
+  },
+  customLogLevel: (_req, res, err) => {
+    if (err || res.statusCode >= 500) return 'error';
+    if (res.statusCode >= 400) return 'warn';
+    return 'info';
+  },
+  // Surface method + url + status + latency in the message string so the
+  // dev terminal shows it inline. pino-pretty hides `req`/`res` in dev
+  // (see src/logger.ts ignore list); prod JSON consumers still get the
+  // full structured payload.
+  customSuccessMessage: (req, res, responseTime) =>
+    `${req.method} ${req.url} ${res.statusCode} (${responseTime}ms)`,
+  customErrorMessage: (req, res, err) =>
+    `${req.method} ${req.url} ${res.statusCode} — ${err instanceof Error ? err.message : String(err)}`,
+}));
+// Echo the pino-http-generated request ID so callers can correlate logs.
+app.use((req, res, next) => {
+  res.setHeader('X-Request-Id', String(req.id ?? ''));
+  next();
+});
+// API responses carry QR codes, session status, phone numbers, and per-call
+// idempotency replays — none of which should ever be cached by intermediaries
+// (CDN, reverse proxy, browser). Default everything to no-store.
+app.use((_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
 app.use(express.json({ limit: '256kb' }));
+// Global rate limit runs BEFORE auth so unauthenticated floods are throttled
+// at the door. Send-specific limiter is applied per-route in src/routes/messages.ts.
+app.use(globalLimiter);
 app.use(authMiddleware);
 
+// Infra endpoints stay unversioned — they're not part of the API contract.
 app.use('/health', healthRouter);
 app.use('/docs', docsRouter);
-app.use('/sessions', sessionsRouter);
-app.use('/messages', messagesRouter);
+app.use('/dashboard', dashboardRouter);
+app.use('/events', eventsRouter);
+
+// Versioned API surface. Breaking changes go in /v2, not by mutating /v1.
+app.use('/v1/sessions', sessionsRouter);
+app.use('/v1/messages', messagesRouter);
 
 app.get('/metrics', async (_, res) => {
   res.set('Content-Type', registry.contentType);
@@ -59,9 +109,17 @@ const PORT = Number(process.env.PORT ?? process.env.WHATSAPP_WORKER_PORT ?? 3001
 const HOST = process.env.WHATSAPP_WORKER_HOST ?? '127.0.0.1';
 
 app.listen(PORT, HOST, () => {
-  console.log(`[worker] WhatsApp worker listening on http://${HOST}:${PORT}`);
-  console.log(`[worker] Restoring saved sessions…`);
+  logger.info({ host: HOST, port: PORT }, 'WhatsApp worker listening');
+  logger.info('Restoring saved sessions…');
   void restoreSessions();
+  // Reconcile bulk batches left in 'processing' by the previous process, then
+  // start the periodic 24h eviction sweep.
+  void markInterruptedBatches();
+  startBulkBatchEviction();
+  // Subscribe to the eventBus and persist message events to Postgres so the
+  // dashboard's feed survives worker restarts. 7-day retention; eviction
+  // sweep runs hourly.
+  startEventPersistence();
 });
 
 // Graceful shutdown — close Chromium cleanly and persist settled sessions so
@@ -74,11 +132,11 @@ process.on('SIGINT', shutdown);
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log('[worker] Shutting down…');
+  logger.info('Shutting down…');
   try {
     await persistAndDestroyAll();
-  } catch (e) {
-    console.error('[worker] shutdown persist error:', e);
+  } catch (err) {
+    logger.error({ err }, 'shutdown persist error');
   }
   process.exit(0);
 }

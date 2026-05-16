@@ -1,17 +1,19 @@
-# fd-whatsapp-worker
+# whatsapp-worker
 
-Pure-API WhatsApp Web worker for **Fududeeye Waxbarasho**. Transport-only:
-the worker exposes HTTPS endpoints (link, status, send), owns its own
-`whatsapp_sessions` table, and has **no knowledge of FD's domain models**
-(schools, students, classes, invoices, payments). FD calls this worker
-over HTTPS for everything WhatsApp-related.
+Pure-API WhatsApp Web worker. Transport-only: the worker exposes HTTPS
+endpoints (link, status, send), owns its own `whatsapp_sessions` table, and
+has **no domain knowledge** of the calling application. Any client app POSTs
+to `/v1/messages/send` over HTTPS — the worker handles the WhatsApp Web
+session, anti-ban pacing, and delivery.
 
-> **Architecture:** the worker reads + writes one Postgres table
-> (`whatsapp_sessions`) in the **same Supabase project as FD**. Isolation
-> is enforced by the worker's Prisma schema scope — only `WhatsAppSession`
-> is declared, so the worker can't accidentally query FD tables. No
-> internal queue: FD's Vercel Cron iterates due reminders and POSTs each
-> one to `/messages/send`.
+> **Architecture:** the worker maintains its own Postgres tables
+> (`whatsapp_sessions`, `whatsapp_bulk_batches`, `whatsapp_message_events`)
+> in whichever Postgres you point `DIRECT_URL` at. The Prisma schema scope
+> is the isolation boundary — only worker-owned tables are declared, so the
+> worker can't accidentally query a consuming application's domain tables
+> when they share a database. No internal queue: the calling app is the
+> source of truth for what to send and when; the worker accepts an
+> individual send or a `/messages/send-bulk` batch and paces delivery.
 
 ---
 
@@ -32,8 +34,8 @@ over HTTPS for everything WhatsApp-related.
 │   ├── prisma.ts              # PrismaClient w/ pg adapter, session pooler
 │   └── anti-ban.ts            # jitter + quiet-hours helpers
 ├── deploy/
-│   ├── fd-worker.service      # systemd unit
-│   └── cloudflared.config.yml # Cloudflare Tunnel ingress
+│   ├── whatsapp-worker.service # systemd unit
+│   └── cloudflared.config.yml  # Cloudflare Tunnel ingress
 ├── .env.example
 └── README.md
 ```
@@ -42,22 +44,36 @@ over HTTPS for everything WhatsApp-related.
 
 ## API surface
 
-All endpoints under `https://<your-tunnel>/`. Auth via the shared
-`X-Worker-Secret` header (matches FD's `WHATSAPP_WORKER_SECRET` env var).
-`/health` is public for tunnel + uptime probes.
+All versioned endpoints sit under `/v1`. Auth via the shared
+`X-Worker-Secret` header (matches the consuming application's
+`WHATSAPP_WORKER_SECRET` env var). The infra endpoints (`/health`,
+`/health/ready`, `/metrics`, `/docs`, `/dashboard`) are public and
+unversioned. Live OpenAPI docs render at `/docs`; the raw spec is at
+`/docs/openapi.json`.
 
-| Method | Path | Body / Notes |
+| Method | Path | Notes |
 |---|---|---|
-| GET  | `/health` | Public. Returns `{ ok: true, uptime }`. |
-| GET  | `/sessions` | Lists every session (live + saved-only). FD reads this for dashboards/sidebars. |
-| POST | `/sessions/:schoolId` | Initialise / get current session. Returns `{ session: { schoolId, status, qrDataUrl, phoneNumber, lastActivity } }`. |
-| GET  | `/sessions/:schoolId` | Poll status + QR for one session. Same shape. |
-| DELETE | `/sessions/:schoolId` | Unlink + destroy. Removes the row. |
-| POST | `/messages/send` | Body `{ schoolId, recipient, body }`. Applies quiet-hours guard (503 + `Retry-After`) and 5–15s jitter, then sends. Synchronous; ~5–15s typical latency. |
+| GET    | `/health` | Liveness — cheap, always 200 while the process is alive. For restart decisions. |
+| GET    | `/health/ready` | Readiness — pings Prisma with a 2s timeout. 503 if the DB is unreachable. For "pull from rotation" decisions. |
+| GET    | `/metrics` | Prometheus scrape (counters: messages sent / failed / bulk batches). |
+| GET    | `/docs` | Scalar UI for the OpenAPI spec. |
+| GET    | `/v1/sessions` | Paginated. Query: `?limit=1..200` (default 50), `?cursor=<opaque>`. Returns `{ sessions, nextCursor }`. |
+| POST   | `/v1/sessions/:sessionId` | Initialise or return existing session. Returns `{ session }`. |
+| GET    | `/v1/sessions/:sessionId` | Poll status + QR for one session. Returns `{ session }` (or `null`). |
+| DELETE | `/v1/sessions/:sessionId` | Unlink + destroy. Returns `{ sessionId }`. |
+| POST   | `/v1/messages/send` | Body `{ sessionId, recipient, body }`. Quiet-hours guard (503), 5–15s jitter, then sends. Synchronous. 200 → `{ messageId, recipientPhone, timestamp }`. Optional `Idempotency-Key` header (8–200 chars) makes retries safe — cached for 24h. |
+| POST   | `/v1/messages/send-bulk` | Body `{ sessionId, messages: [{ recipient, body }] }` (1–500). Returns 202 + `{ batchId }`; sends run in the background, paced by anti-ban jitter. Persisted across restarts. Honors `Idempotency-Key`. |
+| GET    | `/v1/messages/send-bulk/:batchId` | Poll a bulk batch. Status: `processing` / `complete` / `interrupted`. Held for 24h after completion. |
 
-`POST /sessions/:schoolId/send` is kept as a legacy alias while FD's
-`whatsapp-worker/client.ts` migrates from the old per-session send path
-to the unified `/messages/send`. Delete once the FD-side migration is in.
+### Cross-cutting contract
+
+- **Error envelope** (every non-2xx): `{ error: { code, message, requestId, details?, retryAfter? } }`. Codes: `BAD_REQUEST`, `UNAUTHORIZED`, `NOT_FOUND`, `QUIET_HOURS`, `SEND_FAILED`, `INTERNAL`, `IDEMPOTENCY_KEY_REUSED`, `IDEMPOTENT_REQUEST_IN_PROGRESS`, `RATE_LIMITED`, `RECIPIENT_COOLDOWN`, `ACCOUNT_RATE_LIMIT`, `WARMUP_LIMIT`, `GLOBAL_RATE_LIMIT`.
+- **`X-Request-Id` response header** — set on every response; echoed in error envelopes for correlation with worker logs.
+- **`Cache-Control: no-store`** — set on every response. QR codes, session status, and idempotency replays must never be cached.
+- **HTTP rate limits**: 600 req/min global; tighter 30 req/min on send endpoints. 429 carries `Retry-After` and draft-7 `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` headers.
+- **Messaging-layer anti-ban** (inside `sendMessage()`): 5-min per-recipient cooldown, per-account token bucket with 7-day warmup curve (5 → 30 msg/min), 100 msg/min global cap. Each rejection surfaces as 429 with a distinct `error.code`.
+- **Body variation** — the worker appends one of 8 invisible trailing-whitespace variants per send so 100 identical-input messages produce 100 byte-different outputs (`src/lib/body-variation.ts`). Recipients see no change; spam scorers see different fingerprints. Disable with `WHATSAPP_BODY_VARIATION=off`.
+- **Idempotency replay** — when an `Idempotency-Key` matches a cached response, the worker sets `Idempotent-Replay: true` on the reply.
 
 ---
 
@@ -72,15 +88,16 @@ cp .env.example .env          # fill in DIRECT_URL + WHATSAPP_WORKER_SECRET
 npm run dev                   # tsx watch — restarts on save
 ```
 
-`http://localhost:3001/health` should return `{ ok: true, uptime: <seconds> }`.
+`http://127.0.0.1:3001/health` (or whatever you set `WHATSAPP_WORKER_URL` to) should return `{ ok: true, uptime: <seconds> }`.
 
 ---
 
-## Production deploy (ThinkPad X250t · Ubuntu 22.04 LTS)
+## Production deploy (single host · Ubuntu 22.04 LTS)
 
-Pending work (auth, rate limits, host bring-up) is tracked in
-[`TODO.md`](TODO.md). The summary below is the operator's checklist for
-a fresh host.
+Pending work is tracked in [`TODO.md`](TODO.md). The summary below is the
+operator's checklist for a fresh host. Replace `wa-worker` (the chosen
+service / user name in these examples) with whatever you prefer — it's
+just a convention.
 
 ### 1. Base OS hardening
 
@@ -89,9 +106,9 @@ sudo apt update && sudo apt full-upgrade -y
 sudo apt install -y curl git build-essential ufw unattended-upgrades
 
 # Dedicated low-privilege user
-sudo useradd -m -s /bin/bash fdworker
-sudo mkdir -p /var/lib/fd-worker /var/log/fd-worker
-sudo chown -R fdworker:fdworker /var/lib/fd-worker /var/log/fd-worker
+sudo useradd -m -s /bin/bash wa-worker
+sudo mkdir -p /var/lib/wa-worker /var/log/wa-worker
+sudo chown -R wa-worker:wa-worker /var/lib/wa-worker /var/log/wa-worker
 
 # SSH keys-only
 sudo sed -i 's/^#*PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
@@ -104,7 +121,7 @@ sudo ufw allow ssh && sudo ufw enable
 # Auto-updates
 sudo dpkg-reconfigure -plow unattended-upgrades
 
-# Laptop lid-close: don't suspend
+# Laptop lid-close: don't suspend (if deploying on a laptop)
 sudo sed -i 's/^#*HandleLidSwitch=.*/HandleLidSwitch=ignore/' /etc/systemd/logind.conf
 sudo sed -i 's/^#*HandleLidSwitchExternalPower=.*/HandleLidSwitchExternalPower=ignore/' /etc/systemd/logind.conf
 sudo systemctl restart systemd-logind
@@ -122,7 +139,7 @@ sudo apt install -y /tmp/chrome.deb
 # Then in .env: PUPPETEER_EXECUTABLE_PATH=/opt/google/chrome/google-chrome
 
 # Option B: let Puppeteer download its bundled Chromium
-sudo -u fdworker -i npx puppeteer browsers install chrome
+sudo -u wa-worker -i npx puppeteer browsers install chrome
 # Leave PUPPETEER_EXECUTABLE_PATH unset
 ```
 
@@ -137,22 +154,22 @@ node -v   # should print v22.x
 ### 4. Clone + install
 
 ```bash
-sudo -u fdworker -i git clone git@github.com:jihaad/whatsapp-worker.git /home/fdworker/app
-cd /home/fdworker/app
-sudo -u fdworker -i npm install
-sudo -u fdworker -i npm run generate
-sudo -u fdworker -i cp .env.example .env
-sudo -u fdworker -i nano .env       # fill in real values
-sudo chmod 600 /home/fdworker/app/.env
+sudo -u wa-worker -i git clone git@github.com:jihaad/whatsapp-worker.git /home/wa-worker/app
+cd /home/wa-worker/app
+sudo -u wa-worker -i npm install
+sudo -u wa-worker -i npm run generate
+sudo -u wa-worker -i cp .env.example .env
+sudo -u wa-worker -i nano .env       # fill in real values
+sudo chmod 600 /home/wa-worker/app/.env
 ```
 
 ### 5. systemd service
 
 ```bash
-sudo cp deploy/fd-worker.service /etc/systemd/system/fd-worker.service
+sudo cp deploy/whatsapp-worker.service /etc/systemd/system/whatsapp-worker.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now fd-worker
-sudo journalctl -u fd-worker -f     # tail logs
+sudo systemctl enable --now whatsapp-worker
+sudo journalctl -u whatsapp-worker -f     # tail logs
 ```
 
 ### 6. Cloudflare Tunnel
@@ -163,8 +180,8 @@ curl -L --output /tmp/cloudflared.deb \
 sudo dpkg -i /tmp/cloudflared.deb
 
 sudo cloudflared tunnel login
-sudo cloudflared tunnel create fd-worker
-sudo cloudflared tunnel route dns fd-worker worker.fududeeye.so
+sudo cloudflared tunnel create wa-worker
+sudo cloudflared tunnel route dns wa-worker worker.example.com   # your hostname
 
 sudo cp deploy/cloudflared.config.yml /etc/cloudflared/config.yml
 sudo nano /etc/cloudflared/config.yml   # replace <tunnel-id> with the real UUID
@@ -172,44 +189,44 @@ sudo cloudflared service install
 sudo systemctl enable --now cloudflared
 ```
 
-Verify from anywhere: `curl https://worker.fududeeye.so/health` returns
-the public health JSON.
+Verify from anywhere: `curl https://<your-hostname>/health` returns the
+public health JSON.
 
-### 7. FD-side env vars
+### 7. Client env vars
 
-In FD's Vercel project:
+In the consuming application:
 
 ```
-WHATSAPP_WORKER_URL=https://worker.fududeeye.so
+WHATSAPP_WORKER_URL=https://<your-hostname>
 WHATSAPP_WORKER_SECRET=<same value as worker .env>
 ```
 
-Redeploy. From `/super-admin/notifications/queue`, link a school and
-trigger a send — the message should arrive in WhatsApp.
+Redeploy the client. Link a session and trigger a send — the message
+should arrive in WhatsApp.
 
 ---
 
 ## Schema sync
 
-The schema is defined in **`fududeey-waxbarasho`** (the FD repo) at
-`prisma/schema.prisma` for the `WhatsAppSession` model. This repo holds
-a vendored copy. The two must match column-for-column.
+The worker owns its own schema (`prisma/schema.prisma`) — `WhatsAppSession`,
+`WhatsAppBulkBatch`, `WhatsAppMessageEvent`. When the worker shares a
+Postgres instance with another application, you have two choices:
 
-Workflow on every FD schema change that touches `WhatsAppSession`:
+1. **Independent schemas.** The worker's tables and the client's tables
+   live side-by-side in the same database. Schema scope (the worker's
+   Prisma file declares only worker tables) is the isolation boundary.
+   Recommended.
+2. **Shared schema.** If the client mirrors `WhatsAppSession` in its own
+   Prisma schema (rare — usually the client just queries the worker's
+   HTTP API), the two schemas must match column-for-column. Any change
+   in one requires updating the other and running `npm run generate`
+   here.
 
-1. Apply the change in FD with `npx prisma migrate dev --name <descriptive>`.
-2. Copy the model block into `prisma/schema.prisma` in this repo
-   (preserve the worker's `output = "./generated/client"` generator line —
-   FD's points elsewhere). Don't copy FD's `url = env(...)` line into the
-   `datasource db` block: Prisma 7 doesn't accept it in the schema, and the
-   worker reads `DIRECT_URL` via [`prisma.config.ts`](prisma.config.ts) for
-   CLI commands and via the `PrismaPg` adapter at runtime.
-3. `npm run generate` — confirms TypeScript still compiles.
-4. Commit + push. The systemd-managed worker on the ThinkPad picks up
-   on next deploy.
-
-Most schema changes in FD won't touch `WhatsAppSession` and don't need
-this dance.
+The worker uses Prisma 7 with the [`prisma.config.ts`](prisma.config.ts)
+config (feeds `DIRECT_URL` to the CLI). Migrations go via
+`prisma db execute --file ./prisma/sql/<name>.sql` because
+`prisma db push` would propose dropping any table not in the worker's
+schema — see [`prisma/sql/`](prisma/sql/) for canonical migrations.
 
 ---
 
@@ -217,29 +234,30 @@ this dance.
 
 ### Worker is down
 
-Symptoms: tunnel returns 502; `curl /health` times out; FD UI shows
+Symptoms: tunnel returns 502; `curl /health` times out; clients see
 "WhatsApp not connected" everywhere.
 
 ```bash
-ssh fdworker@<host>
-sudo systemctl status fd-worker
-sudo journalctl -u fd-worker -n 200
-sudo systemctl restart fd-worker
-sleep 30 && curl http://127.0.0.1:3001/health
+ssh wa-worker@<host>
+sudo systemctl status whatsapp-worker
+sudo journalctl -u whatsapp-worker -n 200
+sudo systemctl restart whatsapp-worker
+sleep 30 && curl https://<your-hostname>/health
 ```
 
 ### Phone disconnected / WhatsApp banned
 
-Symptoms: every send for one school returns `Session not ready` or
+Symptoms: every send for one session returns `Session not ready` or
 `Phone is not registered`.
 
-1. From FD's `/super-admin/notifications/queue`, filter by school.
-2. Have the school re-link their phone via `/notifications` → "Link Phone".
+1. From the client app, identify the affected session.
+2. Have the operator re-link the phone (POST /v1/sessions/:sessionId,
+   then scan the QR returned by the GET endpoint).
 3. Once the worker reports `status: ready`, retry failed rows.
 
 ### Host rebooted / power loss
 
-Both `fd-worker` and `cloudflared` autostart via systemd. Sessions
+Both `whatsapp-worker` and `cloudflared` autostart via systemd. Sessions
 auto-restore from `whatsapp_sessions` blobs (no fresh QR needed).
 
 ### Token rotation (every 90 days)
@@ -247,48 +265,35 @@ auto-restore from `whatsapp_sessions` blobs (no fresh QR needed).
 ```bash
 openssl rand -hex 32   # new shared secret
 
-# Update both sides without removing the old yet — do FD first so any
-# in-flight call doesn't fail mid-rotation, then rotate the worker.
+# Update both sides without removing the old yet — do the client first so
+# any in-flight call doesn't fail mid-rotation, then rotate the worker.
 # - This repo's .env  → set new value, restart
-# - Vercel env vars   → swap to new value, redeploy
+# - Client env vars   → swap to new value, redeploy
 
-sudo systemctl restart fd-worker
+sudo systemctl restart whatsapp-worker
 ```
-
----
-
-## Anti-ban posture
-
-- **Randomised inter-message jitter** — 5–15s wait inside `POST /messages/send`
-  before whatsapp-web.js dispatches.
-- **Quiet hours** — sends rejected with HTTP 503 + `Retry-After` outside
-  07:00–21:00 EAT.
-- **Re-entrant transient handlers** — Puppeteer's "Execution context was
-  destroyed" / "Target closed" errors are caught and logged, not crashy.
-
-Pending (see [`TODO.md`](TODO.md) §2):
-
-- Per-recipient cooldown (LRU)
-- Daily quota (resets 00:00 EAT)
-- Account warm-up curve
-- Message text variation
-- Read receipts + typing indicator
 
 ---
 
 ## What this worker does not do
 
-- **No WhatsApp Cloud API.** That path lives in the FD Vercel app
-  (`src/lib/whatsapp/`) and runs serverless — it doesn't need this worker.
-- **No queue.** FD owns the `notification_logs` queue. FD's cron iterates
-  due rows and POSTs each to `/messages/send`. The worker is stateless
-  per-message (apart from session state + jitter).
-- **No multi-tenancy.** One worker, one host, one FD instance.
+- **No WhatsApp Cloud API.** Only WhatsApp Web (via whatsapp-web.js +
+  headless Chromium). If you need Cloud API, run it from your client app
+  directly — it doesn't need this worker.
+- **No queue.** The consuming app owns whatever notification log / queue
+  it has, iterates due rows, and POSTs each to `/v1/messages/send` (or
+  submits a `/v1/messages/send-bulk` batch). The worker is stateless
+  per-message apart from session state, jitter, and the anti-ban limits.
+- **No multi-tenancy isolation.** One worker process, one host. Sessions
+  are keyed by an opaque `sessionId` UUID — the worker happily serves
+  multiple `sessionId`s in parallel, but they share the same anti-ban
+  global cap and the same WhatsApp account if you use only one phone.
 - **No HTTP egress beyond the Cloudflare Tunnel + Postgres.** UFW blocks
-  everything else. Don't add outbound calls without thinking about it.
+  everything else by default. Don't add outbound calls without thinking
+  about it.
 
 ---
 
 ## License
 
-Proprietary — Fududeeye Waxbarasho internal infrastructure.
+Proprietary.

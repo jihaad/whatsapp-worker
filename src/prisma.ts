@@ -6,19 +6,16 @@ try { process.loadEnvFile('.env'); } catch { /* file may not exist in prod */ }
 try { process.loadEnvFile('.env.local'); } catch { /* optional override */ }
 
 // The worker is a long-lived process with periodic loops + on-demand send
-// HTTP handlers. Connect via the **session pooler** (DIRECT_URL, port 5432),
-// not the transaction pooler (DATABASE_URL, port 6543).
+// HTTP handlers. If you're on Supabase, connect via the **session pooler**
+// (DIRECT_URL, port 5432) rather than the transaction pooler — the latter
+// is sized for short-lived serverless functions and the worker would
+// quickly exhaust the connection_limit budget.
 //
-// Why: Supabase's transaction pooler is sized for serverless functions
-// (free tier ~15 slots). With FD's Vercel app + the worker both pulling
-// connection_limit=10 from a 15-slot pool, we'd hit ECHECKOUTTIMEOUT under
-// any concurrent load. The session pooler has ~200 slots and gives each
-// long-lived client a stable connection — exactly what the worker wants.
-//
-// **Pure-API note:** the worker uses the same Supabase project as FD
-// (same DIRECT_URL credentials). Isolation is enforced by the worker's
-// Prisma schema scope — it only declares `WhatsAppSession`, not any FD
-// domain models, so the worker can't accidentally query FD tables.
+// **Isolation note:** the worker can safely share a database with other
+// applications. The Prisma schema scope is the boundary — only worker-owned
+// tables are declared (`whatsapp_sessions`, `whatsapp_bulk_batches`,
+// `whatsapp_message_events`), so the generated client cannot query other
+// applications' tables even if they live in the same Postgres.
 //
 // Optional: a dedicated `WORKER_DATABASE_URL` env var lets you override
 // (e.g. point at a separate Postgres later). Falls back to DIRECT_URL.
