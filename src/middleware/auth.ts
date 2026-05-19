@@ -14,7 +14,7 @@ if (!RAW_SECRET) {
 }
 
 const SECRET_BUF = Buffer.from(RAW_SECRET ?? 'dev-worker-secret');
-const PUBLIC_PATHS = new Set(['/health', '/health/ready', '/docs', '/metrics', '/dashboard']);
+const PUBLIC_PATHS = new Set(['/health', '/health/ready', '/docs', '/metrics', '/dashboard', '/favicon.ico', '/favicon.svg']);
 // Scalar mounts at /docs and serves the spec at /docs/openapi.json. The
 // dashboard at /dashboard serves an HTML shell publicly — its JS prompts the
 // operator for the worker secret and includes it on every API call (including

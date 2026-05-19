@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
-import { sendMessage } from '../sessions';
+import { sendMessage, checkLive, reinitializeSessionDebounced } from '../sessions';
 import { isQuietHour, sleepJitter, QUIET_HOURS_MESSAGE } from '../anti-ban';
 import { quietHoursGuard } from '../middleware/quiet-hours';
 import { messagesSent, messagesFailed, bulkBatchesStarted } from '../metrics';
@@ -11,6 +11,7 @@ import { idempotency } from '../lib/idempotency';
 import { sendLimiter } from '../lib/rate-limit';
 import { prisma } from '../prisma';
 import { eventBus } from '../events';
+import { hasOverride } from '../lib/override';
 
 const router = Router();
 
@@ -27,14 +28,21 @@ router.post('/send', quietHoursGuard, sendLimiter, idempotency, async (req, res)
     return;
   }
   const { sessionId, recipient, body } = parsed.data;
+  // Header (operator/curl) OR body field — either turns on the bypass.
+  const override = hasOverride(req);
+  if (override) {
+    req.log.warn({ sessionId, recipient }, 'OVERRIDE — send bypassing all anti-ban gates');
+  }
 
   try {
-    await sleepJitter();
-    const result = await sendMessage(sessionId, recipient, body);
+    // Jitter is part of the human-pacing anti-ban posture; skipped under
+    // override along with the other gates.
+    if (!override) await sleepJitter();
+    const result = await sendMessage(sessionId, recipient, body, { override });
     if (result.success) {
       messagesSent.inc({ type: 'single' });
       eventBus.publish('message.sent', {
-        sessionId, recipient: result.recipientPhone, messageId: result.messageId,
+        sessionId, recipient: result.recipientPhone, messageId: result.messageId, body, override,
       });
       res.json({
         messageId: result.messageId,
@@ -44,15 +52,24 @@ router.post('/send', quietHoursGuard, sendLimiter, idempotency, async (req, res)
     } else if (result.rateLimit) {
       messagesFailed.inc({ type: 'single', reason: result.rateLimit.code.toLowerCase() });
       eventBus.publish('message.failed', {
-        sessionId, recipient: result.recipientPhone, reason: result.rateLimit.code,
+        sessionId, recipient: result.recipientPhone, reason: result.rateLimit.code, body, override,
       });
       sendError(req, res, 429, result.rateLimit.code, result.error ?? 'Rate limited', {
         retryAfter: result.rateLimit.retryAfter,
       });
+    } else if (result.sessionUnhealthy) {
+      messagesFailed.inc({ type: 'single', reason: 'session_unhealthy' });
+      eventBus.publish('message.failed', {
+        sessionId, recipient: result.recipientPhone, reason: 'SESSION_UNHEALTHY', body, override,
+      });
+      sendError(req, res, 503, 'SESSION_UNHEALTHY', result.error ?? 'Session unhealthy', {
+        retryAfter: result.sessionUnhealthy.retryAfter,
+        details: { state: result.sessionUnhealthy.state },
+      });
     } else {
       messagesFailed.inc({ type: 'single', reason: 'send_error' });
       eventBus.publish('message.failed', {
-        sessionId, recipient: result.recipientPhone, reason: result.error ?? 'unknown',
+        sessionId, recipient: result.recipientPhone, reason: result.error ?? 'unknown', body, override,
       });
       sendError(req, res, 502, 'SEND_FAILED', result.error ?? 'Send failed', {
         details: { recipientPhone: result.recipientPhone, timestamp: result.timestamp },
@@ -105,9 +122,34 @@ router.post('/send-bulk', quietHoursGuard, sendLimiter, idempotency, async (req,
     return;
   }
   const { sessionId, messages } = parsed.data;
+  const override = hasOverride(req);
+  if (override) {
+    req.log.warn({ sessionId, count: messages.length }, 'OVERRIDE — bulk send bypassing all anti-ban gates');
+  }
+
+  // Upfront session-health check — better to refuse the whole batch with
+  // 503 SESSION_UNHEALTHY than to accept 500 messages and bounce on the
+  // first one. Per-message liveness still runs inside the loop (catches
+  // mid-batch disconnects), but accepting a batch we know can't ship is
+  // user-hostile. Kicks the debounced reinit on the way out so the session
+  // starts recovering before the caller retries — 15min cooldown protects
+  // the linked phone from re-link bursts.
+  const live = await checkLive(sessionId);
+  if (live !== 'connected') {
+    reinitializeSessionDebounced(sessionId);
+    req.log.warn({ sessionId, state: live }, 'POST /messages/send-bulk refused — session unhealthy');
+    eventBus.publish('message.failed', {
+      sessionId, recipient: '(bulk)', reason: 'SESSION_UNHEALTHY',
+    });
+    sendError(req, res, 503, 'SESSION_UNHEALTHY', 'Session socket is not connected — reinit in progress; retry shortly', {
+      retryAfter: 30,
+      details: { state: live },
+    });
+    return;
+  }
 
   bulkBatchesStarted.inc();
-  eventBus.publish('bulk.started', { sessionId, total: messages.length });
+  eventBus.publish('bulk.started', { sessionId, total: messages.length, override });
 
   const batchId = crypto.randomUUID();
   const batchLog = logger.child({ batchId, sessionId });
@@ -147,9 +189,11 @@ router.post('/send-bulk', quietHoursGuard, sendLimiter, idempotency, async (req,
     for (let i = 0; i < messages.length; i++) {
       const { recipient, body } = messages[i]!;
 
-      if (i > 0) await sleepJitter();
+      // Anti-ban gates only apply when override isn't set: jitter, plus the
+      // mid-batch quiet-hours check that would otherwise pause delivery.
+      if (i > 0 && !override) await sleepJitter();
 
-      if (isQuietHour()) {
+      if (!override && isQuietHour()) {
         for (let j = i; j < messages.length; j++) {
           const m = messages[j]!;
           await recordBatchResult(batchId, {
@@ -166,7 +210,7 @@ router.post('/send-bulk', quietHoursGuard, sendLimiter, idempotency, async (req,
         break;
       }
 
-      const result = await sendMessage(sessionId, recipient, body);
+      const result = await sendMessage(sessionId, recipient, body, { override });
       await recordBatchResult(batchId, {
         index: i,
         recipient,
@@ -182,17 +226,27 @@ router.post('/send-bulk', quietHoursGuard, sendLimiter, idempotency, async (req,
         failed++;
         messagesFailed.inc({
           type: 'bulk',
-          reason: result.rateLimit ? result.rateLimit.code.toLowerCase() : 'send_error',
+          reason: result.rateLimit ? result.rateLimit.code.toLowerCase()
+            : result.sessionUnhealthy ? 'session_unhealthy'
+            : 'send_error',
         });
+        // Session went unhealthy mid-batch — abort the rest. Continuing
+        // would just emit hundreds more SESSION_UNHEALTHY failures with no
+        // chance of success, and reinit is already kicked off. Caller can
+        // re-submit the remaining items after the session recovers.
+        if (result.sessionUnhealthy) {
+          batchLog.warn({ remaining: messages.length - i - 1 }, 'session unhealthy — aborting bulk batch');
+          break;
+        }
       }
     }
 
     batchLog.info({ succeeded, failed, total: messages.length }, 'bulk batch complete');
-    eventBus.publish('bulk.completed', { batchId, sessionId, succeeded, failed, total: messages.length });
+    eventBus.publish('bulk.completed', { batchId, sessionId, succeeded, failed, total: messages.length, override });
     await finaliseBatch();
   })().catch(async (err) => {
     batchLog.error({ err }, 'bulk batch crashed');
-    eventBus.publish('bulk.completed', { batchId, sessionId, crashed: true, error: err instanceof Error ? err.message : String(err) });
+    eventBus.publish('bulk.completed', { batchId, sessionId, crashed: true, error: err instanceof Error ? err.message : String(err), override });
     await finaliseBatch();
   });
 });

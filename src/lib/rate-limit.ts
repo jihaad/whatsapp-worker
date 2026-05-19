@@ -1,5 +1,6 @@
 import { rateLimit, type Options } from 'express-rate-limit';
 import { sendError } from './errors';
+import { hasOverride } from './override';
 
 /**
  * Per-IP HTTP rate limiting. Sits in front of (or per-route on top of) the
@@ -31,7 +32,9 @@ const COMMON: Partial<Options> = {
     req.path.startsWith('/docs/') ||
     req.path === '/dashboard' ||
     req.path.startsWith('/dashboard/') ||
-    req.path === '/events',
+    req.path === '/events' ||
+    req.path === '/favicon.ico' ||
+    req.path === '/favicon.svg',
 };
 
 function envelopeHandler(message: string) {
@@ -65,5 +68,8 @@ export const sendLimiter = rateLimit({
   ...COMMON,
   windowMs: 60_000,
   limit: 30,
+  // Operator override (`X-Worker-Override: 1`) bypasses the send-bucket.
+  // High ban risk — explicitly opted into and logged loudly downstream.
+  skip: (req, res) => Boolean(COMMON.skip && COMMON.skip(req, res)) || hasOverride(req),
   handler: envelopeHandler('Send rate limit exceeded — pace your sends'),
 });

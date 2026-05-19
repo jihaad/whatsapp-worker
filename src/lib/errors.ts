@@ -21,7 +21,11 @@ export type ErrorCode =
   | 'RECIPIENT_COOLDOWN'
   | 'ACCOUNT_RATE_LIMIT'
   | 'WARMUP_LIMIT'
-  | 'GLOBAL_RATE_LIMIT';
+  | 'GLOBAL_RATE_LIMIT'
+  // Session's underlying WhatsApp Web socket is dead. Distinct from a
+  // genuine "phone not on WhatsApp" lookup miss — the right caller
+  // response is "retry later", not "the number is wrong".
+  | 'SESSION_UNHEALTHY';
 
 interface ErrorOptions {
   details?: unknown;

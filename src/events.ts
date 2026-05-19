@@ -25,7 +25,11 @@ export type WorkerEventType =
   | 'message.sent'
   | 'message.failed'
   | 'bulk.started'
-  | 'bulk.completed';
+  | 'bulk.completed'
+  // HTTP request trace — captured by src/middleware/request-trace.ts and
+  // shown in the dashboard's Network panel. Intentionally NOT persisted
+  // by event-persistence.ts (would explode the DB on busy days).
+  | 'http.request';
 
 export interface WorkerEvent {
   type: WorkerEventType;
@@ -45,8 +49,13 @@ class WorkerEventBus extends EventEmitter {
 
   publish(type: WorkerEventType, data: Record<string, unknown> = {}): void {
     const event: WorkerEvent = { type, ts: new Date().toISOString(), data };
-    this.recent.push(event);
-    if (this.recent.length > RECENT_BUFFER_SIZE) this.recent.shift();
+    // HTTP traces are high-volume and don't need cross-reconnect replay —
+    // the dashboard's Network panel only cares about live events. Keep
+    // them out of the ring so message-event backfill isn't starved.
+    if (type !== 'http.request') {
+      this.recent.push(event);
+      if (this.recent.length > RECENT_BUFFER_SIZE) this.recent.shift();
+    }
     this.emit('event', event);
   }
 

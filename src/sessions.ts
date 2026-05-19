@@ -29,6 +29,10 @@ export interface SchoolSession {
   qrDataUrl: string | null;
   phoneNumber: string | null;
   lastActivity: string;
+  // ISO timestamp of when the session most recently entered `ready` state.
+  // Null whenever status !== 'ready'. Lets the dashboard show
+  // "connected for Xm Ys" without storing extra state client-side.
+  readySince: string | null;
 }
 
 export interface SendMessageResult {
@@ -41,6 +45,11 @@ export interface SendMessageResult {
   // (recipient cooldown, per-account / global / warmup). The route handler
   // checks for this and maps to HTTP 429 with the standard error envelope.
   rateLimit?: { code: 'RECIPIENT_COOLDOWN' | 'ACCOUNT_RATE_LIMIT' | 'WARMUP_LIMIT' | 'GLOBAL_RATE_LIMIT'; retryAfter: number };
+  // Populated when the WhatsApp Web socket is dead (or unresponsive). The
+  // route handler maps to HTTP 503 SESSION_UNHEALTHY. Distinct from
+  // "phone not on WhatsApp" so the caller knows to retry, not to fix the
+  // recipient.
+  sessionUnhealthy?: { state: string; retryAfter: number };
 }
 
 interface ManagedSession {
@@ -50,6 +59,21 @@ interface ManagedSession {
   qrDataUrl: string | null;
   phoneNumber: string | null;
   lastActivity: string;
+  // ISO timestamp of when the session most recently flipped to `ready`.
+  // Cleared whenever status leaves `ready` (disconnect, auth failure,
+  // liveness-probe flip). The dashboard shows "connected for Xm Ys" using
+  // this so operators can see at a glance how stable a session has been.
+  readySince: string | null;
+  // ms-timestamp of the last live getState() result. Used to skip the
+  // Puppeteer round-trip on hot send paths if we checked very recently.
+  lastStateCheck?: number;
+  // ms-timestamp of the last reinit attempt. Combined with REINIT_COOLDOWN_MS
+  // to hard-cap reinit frequency — WhatsApp ratelimits re-link attempts and
+  // a loose loop here would expose the linked phone to bans.
+  lastReinitAt?: number;
+  // True while a reinit is running. Other reinit requests during this
+  // window are no-ops to avoid concurrent destroy/init races.
+  reinitInFlight?: boolean;
 }
 
 const sessions = new Map<string, ManagedSession>();
@@ -113,10 +137,24 @@ async function tryInitialize(client: Client, schoolId: string): Promise<void> {
 export async function initSession(schoolId: string, isRestore = false): Promise<SchoolSession> {
   const existing = sessions.get(schoolId);
   if (existing) {
+    // If the caller is asking for a session that's currently disconnected,
+    // treat the POST as "please reconnect this dead session". Trigger a
+    // forced reinit (skips the 15min auto-cooldown — explicit caller
+    // intent). The in-flight lock still prevents concurrent attempts.
+    // Returns the current (still-disconnected) snapshot immediately; the
+    // caller polls GET /v1/sessions/:id and sees status flip to
+    // `connecting` → `ready` (or `qr_pending` if the blob is rejected).
+    if (existing.status === 'disconnected') {
+      logger.child({ schoolId }).info('initSession on disconnected session — kicking forced reinit');
+      reinitializeSessionDebounced(schoolId, { force: true });
+    }
     return toSchoolSession(schoolId, existing);
   }
 
-  eventBus.publish('session.init', { sessionId: schoolId, isRestore });
+  eventBus.publish('session.init', {
+    sessionId: schoolId, isRestore,
+    status: 'connecting', phoneNumber: null, qrDataUrl: null, lastActivity: new Date().toISOString(),
+  });
   const log = logger.child({ schoolId });
   const auth = new DatabaseAuth({ clientId: schoolId, dataPath: getSessionDir() });
   const initStart = Date.now();
@@ -157,6 +195,7 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
     qrDataUrl: null,
     phoneNumber: null,
     lastActivity: new Date().toISOString(),
+    readySince: null,
   };
   sessions.set(schoolId, managed);
 
@@ -170,7 +209,10 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
       managed.status = 'qr_pending';
       managed.lastActivity = new Date().toISOString();
       log.info({ elapsedMs: Date.now() - initStart }, 'qr ready');
-      eventBus.publish('session.qr', { sessionId: schoolId, elapsedMs: Date.now() - initStart });
+      eventBus.publish('session.qr', {
+        sessionId: schoolId, elapsedMs: Date.now() - initStart,
+        status: 'qr_pending', qrDataUrl: managed.qrDataUrl, phoneNumber: managed.phoneNumber, lastActivity: managed.lastActivity,
+      });
 
       if (isRestore && !qrSeen) {
         qrSeen = true;
@@ -185,11 +227,16 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
   client.on('ready', async () => {
     managed.status = 'ready';
     managed.qrDataUrl = null;
+    managed.readySince = new Date().toISOString();
     managed.lastActivity = new Date().toISOString();
     const info = client.info;
     if (info?.wid?.user) managed.phoneNumber = info.wid.user;
     log.info({ phoneNumber: managed.phoneNumber }, 'session ready');
-    eventBus.publish('session.ready', { sessionId: schoolId, phoneNumber: managed.phoneNumber });
+    eventBus.publish('session.ready', {
+      sessionId: schoolId, phoneNumber: managed.phoneNumber,
+      status: 'ready', qrDataUrl: null, lastActivity: managed.lastActivity,
+      readySince: managed.readySince,
+    });
 
     // Wait for Chromium to flush IndexedDB to disk before taring the session.
     // 20s gives the initial WhatsApp history sync room to land before we
@@ -200,13 +247,31 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
     await new Promise((r) => setTimeout(r, 20000));
 
     await auth.persistToDatabase(managed.phoneNumber ?? undefined).catch((err) => {
+      // P2003 = Postgres foreign-key violation. The worker's whatsapp_sessions
+      // table picks one up whenever the consuming application's Prisma schema
+      // declares a WhatsAppSession with `@relation`, then runs `db push`. Drop
+      // it via prisma/sql/drop_session_fk.sql; the durable fix is to isolate
+      // the worker's DB (TODO §3) so cross-schema corruption can't happen.
+      const code = (err as { code?: string }).code;
+      const meta = (err as { meta?: { driverAdapterError?: { cause?: { constraint?: { index?: string } } } } }).meta;
+      const constraint = meta?.driverAdapterError?.cause?.constraint?.index;
+      if (code === 'P2003') {
+        log.error(
+          { code, constraint },
+          'persist on ready failed — FK violation on whatsapp_sessions. Session is functional in memory but will NOT survive restart. Drop the FK with: npx prisma db execute --file ./prisma/sql/drop_session_fk.sql. Long-term: TODO §3 (isolate worker DB).',
+        );
+        return;
+      }
       log.error({ err }, 'persist on ready failed');
     });
   });
 
   client.on('authenticated', () => {
     log.info('authenticated');
-    eventBus.publish('session.authenticated', { sessionId: schoolId });
+    eventBus.publish('session.authenticated', {
+      sessionId: schoolId,
+      status: 'connecting', phoneNumber: managed.phoneNumber, qrDataUrl: null, lastActivity: managed.lastActivity,
+    });
     managed.status = 'connecting';
     managed.lastActivity = new Date().toISOString();
   });
@@ -217,11 +282,21 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
 
   client.on('disconnected', (reason) => {
     log.info({ reason }, 'session disconnected');
-    eventBus.publish('session.disconnected', { sessionId: schoolId, reason: String(reason) });
+    eventBus.publish('session.disconnected', {
+      sessionId: schoolId, reason: String(reason),
+      status: 'disconnected', phoneNumber: managed.phoneNumber, qrDataUrl: null, lastActivity: managed.lastActivity,
+    });
     managed.status = 'disconnected';
     managed.qrDataUrl = null;
+    managed.readySince = null;
     managed.lastActivity = new Date().toISOString();
-    sessions.delete(schoolId);
+    // Deliberately NOT calling sessions.delete(schoolId) here. The watchdog
+    // sweeps disconnected entries and attempts reinit (debounced — 15 min
+    // cooldown applies), so a brief network blip self-heals: first sweep
+    // after connectivity returns triggers reinit, and tryInitialize will
+    // either succeed or remove the entry on persistent failure.
+    // Auth-failure stays a hard delete (separate handler below) — same blob
+    // won't recover.
   });
 
   // Best-effort read receipts. WhatsApp engagement scoring rewards accounts
@@ -238,9 +313,13 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
 
   client.on('auth_failure', (msg) => {
     log.error({ msg }, 'auth failure');
-    eventBus.publish('session.auth_failure', { sessionId: schoolId, reason: String(msg) });
+    eventBus.publish('session.auth_failure', {
+      sessionId: schoolId, reason: String(msg),
+      status: 'disconnected', phoneNumber: managed.phoneNumber, qrDataUrl: null, lastActivity: managed.lastActivity,
+    });
     managed.status = 'disconnected';
     managed.qrDataUrl = null;
+    managed.readySince = null;
     sessions.delete(schoolId);
   });
 
@@ -253,6 +332,15 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
     log.error({ err }, 'init failed');
     sessions.delete(schoolId);
     client.destroy().catch(() => {});
+    // Deliberately do NOT drop the DB row on a restore-path init failure.
+    // Earlier attempts at that self-heal were too aggressive: any transient
+    // failure (Chromium contention on cold boot, exhausted "Execution
+    // context destroyed" retries, slow disk) would wipe a perfectly valid
+    // saved blob, and we'd lose sessions across restarts.
+    // The genuine "WhatsApp rejected the blob" case is handled separately
+    // by the QR-on-restore branch above: when WA Web rejects the auth it
+    // emits a QR, and we drop the row there. That's the only signal we
+    // can trust. Anything else here is "try again next restart".
   });
 
   return toSchoolSession(schoolId, managed);
@@ -321,16 +409,31 @@ export async function restoreSessions(): Promise<void> {
 
   logger.info({ count: ids.size }, 'restoring sessions in background');
 
+  // Stagger Chromium launches. Without this, every saved session boots its
+  // own Puppeteer instance simultaneously on cold-start. On a laptop /
+  // single-host worker, the contention causes some launches to throw
+  // "Execution context was destroyed" past tryInitialize's 3 retries —
+  // sessions that would otherwise restore fine. 3s between launches keeps
+  // disk + CPU calm; the first session is up before the next starts loading.
+  const RESTORE_STAGGER_MS = 3_000;
+  let i = 0;
   for (const schoolId of ids) {
     if (sessions.has(schoolId) || initializing.has(schoolId)) continue;
 
+    const delay = i * RESTORE_STAGGER_MS;
+    i++;
     initializing.add(schoolId);
-    initSession(schoolId, /* isRestore */ true)
-      .catch((err) => {
-        logger.error({ err, schoolId }, 'failed to restore session');
-        sessions.delete(schoolId);
-      })
-      .finally(() => initializing.delete(schoolId));
+    setTimeout(() => {
+      // Re-check the maps after the delay — operator may have linked or
+      // deleted this session via the API while we were waiting.
+      if (sessions.has(schoolId)) { initializing.delete(schoolId); return; }
+      initSession(schoolId, /* isRestore */ true)
+        .catch((err) => {
+          logger.error({ err, schoolId }, 'failed to restore session');
+          sessions.delete(schoolId);
+        })
+        .finally(() => initializing.delete(schoolId));
+    }, delay).unref();
   }
 }
 
@@ -388,17 +491,26 @@ export async function persistAndDestroyAll(timeoutMs = 30_000): Promise<void> {
 export async function getSession(schoolId: string): Promise<SchoolSession | null> {
   const managed = sessions.get(schoolId);
   if (managed) {
+    // Silent-disconnect detection on the polling endpoint. checkLive() has
+    // a 5s cache so back-to-back polls don't add a getState round-trip
+    // each. If the underlying socket has died, this flips managed.status
+    // before we serialise it for the response — so the dashboard sees
+    // reality, not a stale "ready". **Detect-only**: never triggers reinit
+    // (that happens only on the send path).
+    if (managed.status === 'ready') {
+      await checkLive(schoolId).catch(() => {});
+    }
     return toSchoolSession(schoolId, managed);
   }
 
   // Restore in-flight — tell the caller to keep polling
   if (initializing.has(schoolId)) {
-    return { sessionId: schoolId, status: 'connecting', qrDataUrl: null, phoneNumber: null, lastActivity: '' };
+    return { sessionId: schoolId, status: 'connecting', qrDataUrl: null, phoneNumber: null, lastActivity: '', readySince: null };
   }
 
   const hasSaved = await prisma.whatsAppSession.findUnique({ where: { schoolId }, select: { schoolId: true } });
   if (hasSaved) {
-    return { sessionId: schoolId, status: 'disconnected', qrDataUrl: null, phoneNumber: null, lastActivity: '' };
+    return { sessionId: schoolId, status: 'disconnected', qrDataUrl: null, phoneNumber: null, lastActivity: '', readySince: null };
   }
   return null;
 }
@@ -446,6 +558,7 @@ export async function listSessions(opts: { limit: number; cursor?: string } = { 
       sessionId: row.schoolId,
       status: 'disconnected' as const,
       qrDataUrl: null,
+      readySince: null,
       phoneNumber: row.phoneNumber,
       lastActivity: row.updatedAt.toISOString(),
     }));
@@ -471,6 +584,167 @@ export async function listSessions(opts: { limit: number; cursor?: string } = { 
   return { sessions: page, nextCursor };
 }
 
+// ---------------------------------------------------------------------------
+// Liveness probes + self-healing reinit
+//
+// The bedrock problem: a session's in-memory status can read `ready` while
+// the underlying WhatsApp Web socket is silently dead (Puppeteer disconnect,
+// navigation, network drop). When that happens, getNumberId() throws and the
+// worker historically returned the misleading "not registered". The helpers
+// below give the send path a way to detect that state and recover without
+// exposing the account to a ban.
+//
+// **Ban-safety contract:** `client.getState()` is a local DOM read inside
+// the WA Web SPA — no network traffic to WhatsApp. Safe to call freely.
+// `client.initialize()` does hit WhatsApp's auth flow — frequent reinits
+// look like bot behaviour and risk a ban. `reinitializeSessionDebounced()`
+// enforces a hard 15-minute cooldown + an in-flight lock; nothing else
+// (watchdog, getSession live-check, dashboard) can trigger reinit.
+// ---------------------------------------------------------------------------
+
+const STATE_CHECK_TIMEOUT_MS = 1500;
+const STATE_CHECK_CACHE_MS = 5_000;
+const REINIT_COOLDOWN_MS = 15 * 60 * 1000;
+
+export async function checkLive(schoolId: string, opts: { force?: boolean } = {}): Promise<'connected' | 'disconnected' | 'unknown'> {
+  const managed = sessions.get(schoolId);
+  if (!managed) return 'unknown';
+
+  // Skip the round-trip if we just checked. Doesn't help correctness — it
+  // helps latency, since the send path calls this before every send.
+  const fresh = managed.lastStateCheck && Date.now() - managed.lastStateCheck < STATE_CHECK_CACHE_MS;
+  if (fresh && !opts.force) {
+    return managed.status === 'ready' ? 'connected' : 'disconnected';
+  }
+
+  let state: string | null = null;
+  try {
+    state = await Promise.race([
+      managed.client.getState() as Promise<string>,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), STATE_CHECK_TIMEOUT_MS)),
+    ]);
+  } catch {
+    state = null;
+  }
+  managed.lastStateCheck = Date.now();
+
+  if (state === 'CONNECTED') return 'connected';
+
+  // Anything else (TIMEOUT, UNPAIRED, CONFLICT, UNLAUNCHED, OPENING,
+  // PAIRING, null on Puppeteer-detached page) is non-live. Flip status if
+  // we're transitioning out of `ready` so consumers see reality.
+  if (managed.status === 'ready') {
+    const log = logger.child({ schoolId });
+    log.warn({ state }, 'session liveness check failed — marking disconnected');
+    managed.status = 'disconnected';
+    managed.qrDataUrl = null;
+    managed.readySince = null;
+    eventBus.publish('session.disconnected', {
+      sessionId: schoolId,
+      reason: 'liveness_check_failed:' + String(state ?? 'TIMEOUT'),
+      status: 'disconnected',
+      phoneNumber: managed.phoneNumber,
+      qrDataUrl: null,
+      lastActivity: managed.lastActivity,
+    });
+  }
+  return 'disconnected';
+}
+
+/**
+ * Reinitialise a session whose socket has died. Ban-safety guarded:
+ *   - In-flight lock prevents concurrent destroy/init.
+ *   - 15-minute cooldown between attempts caps the WhatsApp re-auth burst
+ *     rate. Without this, a barrage of sends to a dead session would each
+ *     trigger an init, which WA's bot detector will flag.
+ *
+ * Returns immediately if either guard would skip the attempt. The caller
+ * still gets a 503 SESSION_UNHEALTHY from the surrounding send path; we're
+ * accepting some delay before the session recovers in exchange for not
+ * burning the linked phone.
+ */
+/**
+ * Watchdog sweep — runs every 5 min from src/lib/session-watchdog.ts.
+ *
+ * Two passes:
+ *   1. `ready` sessions: forced checkLive() to catch silent socket deaths.
+ *      checkLive flips status → disconnected on failure (handler keeps the
+ *      entry in the map, see client.on('disconnected') above).
+ *   2. `disconnected` sessions: trigger reinitializeSessionDebounced.
+ *      No `force` — the 15-min cooldown means at most one reinit attempt
+ *      per session per cooldown window, which is the ban-safety contract
+ *      we're committed to. First sweep after a network drop attempts a
+ *      reinit; subsequent sweeps within the cooldown are skipped.
+ *
+ * Net effect: short network blip on the host → session disconnects → next
+ * 5-min sweep auto-reconnects without operator action. Longer outages or
+ * persistent reinit failure still need a manual Reconnect from the dashboard.
+ */
+export async function runWatchdogSweep(): Promise<void> {
+  const readyIds: string[] = [];
+  const disconnectedIds: string[] = [];
+  for (const [id, m] of sessions.entries()) {
+    if (m.status === 'ready') readyIds.push(id);
+    else if (m.status === 'disconnected') disconnectedIds.push(id);
+  }
+  for (const id of readyIds) {
+    await checkLive(id, { force: true }).catch(() => {});
+  }
+  for (const id of disconnectedIds) {
+    // Fire-and-forget — reinit is async and the watchdog shouldn't block
+    // waiting for Chromium to spin up. In-flight lock prevents concurrent
+    // reinits for the same session if a send arrives while we're working.
+    reinitializeSessionDebounced(id);
+  }
+}
+
+export function reinitializeSessionDebounced(schoolId: string, opts: { force?: boolean } = {}): void {
+  const managed = sessions.get(schoolId);
+  const log = logger.child({ schoolId });
+
+  if (managed?.reinitInFlight) {
+    log.debug('reinit already in flight — skipping');
+    return;
+  }
+  // The cooldown protects against AUTO retriggers from the send path that
+  // would re-link a dead session over and over. Operator-initiated reinits
+  // (force=true, e.g. dashboard Reconnect button) bypass it — a human
+  // clicking once isn't going to trip WhatsApp's bot detector. The
+  // in-flight lock above still prevents concurrent destroy/init.
+  if (!opts.force && managed?.lastReinitAt && Date.now() - managed.lastReinitAt < REINIT_COOLDOWN_MS) {
+    const waitMin = Math.ceil((REINIT_COOLDOWN_MS - (Date.now() - managed.lastReinitAt)) / 60_000);
+    log.debug({ waitMin }, 'reinit on cooldown — skipping');
+    return;
+  }
+  if (opts.force) {
+    log.info('reinit: forced by caller (operator action) — bypassing cooldown');
+  }
+
+  if (managed) {
+    managed.reinitInFlight = true;
+    managed.lastReinitAt = Date.now();
+  }
+
+  (async () => {
+    log.info('reinit: tearing down dead session');
+    try {
+      if (managed) {
+        await managed.client.destroy().catch(() => { /* dead anyway */ });
+      }
+      sessions.delete(schoolId);
+      // Reuse initSession's restore path so the saved blob is picked up and
+      // the existing init-failed-on-restore self-heal applies.
+      await initSession(schoolId, /* isRestore */ true);
+      log.info('reinit: kicked off fresh initSession');
+    } catch (err) {
+      log.error({ err }, 'reinit failed');
+    } finally {
+      const m = sessions.get(schoolId);
+      if (m) m.reinitInFlight = false;
+    }
+  })();
+}
+
 export async function destroySession(schoolId: string): Promise<void> {
   const managed = sessions.get(schoolId);
   if (managed) {
@@ -485,9 +759,20 @@ export async function destroySession(schoolId: string): Promise<void> {
   eventBus.publish('session.deleted', { sessionId: schoolId });
 }
 
-export async function sendMessage(schoolId: string, to: string, body: string): Promise<SendMessageResult> {
+export async function sendMessage(
+  schoolId: string,
+  to: string,
+  body: string,
+  opts: { override?: boolean } = {},
+): Promise<SendMessageResult> {
   const managed = sessions.get(schoolId);
   const log = logger.child({ schoolId });
+  // Override only skips ANTI-BAN gates (cooldown, token buckets, jitter).
+  // Liveness, auth, and idempotency still apply.
+  const override = opts.override === true;
+  if (override) {
+    log.warn({ to }, 'OVERRIDE — anti-ban gates bypassed for this send (high ban risk)');
+  }
 
   if (!managed || managed.status !== 'ready') {
     return {
@@ -499,32 +784,56 @@ export async function sendMessage(schoolId: string, to: string, body: string): P
     };
   }
 
-  // Messaging-layer rate limits — recipient cooldown, then per-account
-  // (warmup-aware) + global token buckets. Bulk batches loop through this
-  // same path so coverage is automatic across single + bulk sends.
-  const cooldown = checkRecipientCooldown(to);
-  if (!cooldown.ok) {
-    log.warn({ to, retryAfter: cooldown.retryAfter }, 'recipient cooldown — skipping send');
+  // Liveness check — the in-memory `ready` status can lie when the WA Web
+  // socket has died silently. checkLive() does a cached getState() and
+  // mutates managed.status if the socket is gone. On non-connected we kick
+  // off a debounced reinit (hard-cooldown protects the linked phone from
+  // re-link burst bans) and tell the caller to retry. Placed before the
+  // rate-limit checks so a dead session doesn't consume tokens or trip
+  // recipient cooldowns.
+  const live = await checkLive(schoolId);
+  if (live !== 'connected') {
+    reinitializeSessionDebounced(schoolId);
+    log.warn({ to, state: live }, 'session unhealthy — returning SESSION_UNHEALTHY');
     return {
       success: false,
       messageId: null,
       recipientPhone: to,
-      error: cooldown.message,
-      rateLimit: { code: cooldown.code, retryAfter: cooldown.retryAfter },
+      error: 'Session socket is not connected — reinit is in progress; retry shortly',
+      sessionUnhealthy: { state: live, retryAfter: 30 },
       timestamp: new Date().toISOString(),
     };
   }
-  const tokens = await consumeRateTokens(schoolId);
-  if (!tokens.ok) {
-    log.warn({ to, code: tokens.code, retryAfter: tokens.retryAfter }, 'messaging-layer rate limit — skipping send');
-    return {
-      success: false,
-      messageId: null,
-      recipientPhone: to,
-      error: tokens.message,
-      rateLimit: { code: tokens.code, retryAfter: tokens.retryAfter },
-      timestamp: new Date().toISOString(),
-    };
+
+  // Messaging-layer rate limits — recipient cooldown, then per-account
+  // (warmup-aware) + global token buckets. Bulk batches loop through this
+  // same path so coverage is automatic across single + bulk sends.
+  // Override (operator opt-in) skips every gate below.
+  if (!override) {
+    const cooldown = checkRecipientCooldown(to);
+    if (!cooldown.ok) {
+      log.warn({ to, retryAfter: cooldown.retryAfter }, 'recipient cooldown — skipping send');
+      return {
+        success: false,
+        messageId: null,
+        recipientPhone: to,
+        error: cooldown.message,
+        rateLimit: { code: cooldown.code, retryAfter: cooldown.retryAfter },
+        timestamp: new Date().toISOString(),
+      };
+    }
+    const tokens = await consumeRateTokens(schoolId);
+    if (!tokens.ok) {
+      log.warn({ to, code: tokens.code, retryAfter: tokens.retryAfter }, 'messaging-layer rate limit — skipping send');
+      return {
+        success: false,
+        messageId: null,
+        recipientPhone: to,
+        error: tokens.message,
+        rateLimit: { code: tokens.code, retryAfter: tokens.retryAfter },
+        timestamp: new Date().toISOString(),
+      };
+    }
   }
 
   const chatId = normalizeToWhatsAppId(to);
@@ -534,17 +843,41 @@ export async function sendMessage(schoolId: string, to: string, body: string): P
     // Without this, whatsapp-web.js throws a cryptic one-char error ("t")
     // from the injected page context when the chat doesn't exist.
     let numberId: { _serialized: string } | null = null;
+    let lookupThrew = false;
     try {
       numberId = await managed.client.getNumberId(chatId);
     } catch (err) {
-      // getNumberId errors aren't fatal — fall through to the raw sendMessage
-      // attempt, which might still succeed. Log so we can see what's breaking.
+      // Historically we collapsed this into a generic "not registered" reply,
+      // which masked the dead-socket symptom in prod. Now: log it, mark
+      // lookupThrew so we can disambiguate below with a forced liveness probe.
       log.error({ err, chatId }, 'getNumberId threw');
+      lookupThrew = true;
       numberId = null;
     }
 
     if (!numberId) {
-      log.warn({ to, chatId }, 'send target not a WhatsApp user (or getNumberId threw — see above)');
+      // If the lookup *threw* (vs cleanly returned null), the most likely
+      // cause is a dead WhatsApp Web socket — re-probe with force=true to
+      // bypass the 5s cache and learn the real state. Only return
+      // SESSION_UNHEALTHY when the probe confirms a dead socket; if the
+      // socket is still alive the throw was a genuine lookup miss and we
+      // preserve the "not registered" friendly message.
+      if (lookupThrew) {
+        const probeLive = await checkLive(schoolId, { force: true });
+        if (probeLive !== 'connected') {
+          reinitializeSessionDebounced(schoolId);
+          log.warn({ to, chatId, state: probeLive }, 'getNumberId failure was caused by dead socket — returning SESSION_UNHEALTHY');
+          return {
+            success: false,
+            messageId: null,
+            recipientPhone: to,
+            error: 'Session socket dropped during number lookup — reinit in progress; retry shortly',
+            sessionUnhealthy: { state: probeLive, retryAfter: 30 },
+            timestamp: new Date().toISOString(),
+          };
+        }
+      }
+      log.warn({ to, chatId }, 'send target not a WhatsApp user');
       return {
         success: false,
         messageId: null,
@@ -589,7 +922,7 @@ export async function sendMessage(schoolId: string, to: string, body: string): P
 }
 
 function toSchoolSession(schoolId: string, m: ManagedSession): SchoolSession {
-  return { sessionId: schoolId, status: m.status, qrDataUrl: m.qrDataUrl, phoneNumber: m.phoneNumber, lastActivity: m.lastActivity };
+  return { sessionId: schoolId, status: m.status, qrDataUrl: m.qrDataUrl, phoneNumber: m.phoneNumber, lastActivity: m.lastActivity, readySince: m.readySince };
 }
 
 /**

@@ -25,6 +25,9 @@ const HTML = /* html */ `<!DOCTYPE html>
 <meta charset="utf-8" />
 <title>WhatsApp Worker — dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- WhatsApp glyph favicon. Inline SVG (data URI) — no external request,
+     no licensing fetch. Glyph is the SimpleIcons WhatsApp path (CC0). -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='12' r='12' fill='%2325D366'/><path fill='%23fff' d='M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347M5.96 18.04l.4-.214a7.78 7.78 0 003.97 1.088h.003c4.299 0 7.797-3.498 7.799-7.797a7.74 7.74 0 00-2.282-5.516 7.74 7.74 0 00-5.51-2.286C6.043 3.315 2.546 6.813 2.545 11.112a7.74 7.74 0 001.19 4.146l.185.295-.787 2.877z'/></svg>" />
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   :root {
@@ -147,6 +150,18 @@ const HTML = /* html */ `<!DOCTYPE html>
     <span>disconnected</span>
   </div>
 
+  <div class="status-pill text-neutral-400" title="Worker process uptime">
+    <span class="text-neutral-500 text-[10px] uppercase tracking-wider">up</span>
+    <span id="worker-uptime" class="num text-neutral-200">—</span>
+  </div>
+
+  <!-- View mode tabs -->
+  <div class="seg rounded-lg p-1 flex gap-1 ml-2">
+    <button data-mode="messages" class="mode-btn seg-btn is-active px-4 py-1.5 rounded-md text-xs font-medium">Messages</button>
+    <button data-mode="network"  class="mode-btn seg-btn px-4 py-1.5 rounded-md text-xs font-medium">Network <span class="count" id="cnt-net">0</span></button>
+    <button data-mode="sessions" class="mode-btn seg-btn px-4 py-1.5 rounded-md text-xs font-medium">Sessions <span class="count" id="cnt-sess">0</span></button>
+  </div>
+
   <div class="ml-auto flex items-center gap-4 text-sm text-neutral-400">
     <label class="flex items-center gap-2 cursor-pointer select-none hover:text-neutral-200 transition-colors">
       <input id="reveal" type="checkbox" class="accent-amber-500" />
@@ -156,6 +171,11 @@ const HTML = /* html */ `<!DOCTYPE html>
     <button id="logout" class="hover:text-neutral-200 transition-colors">Forget secret</button>
   </div>
 </header>
+
+<!-- ============================================================ -->
+<!-- VIEW: Messages (default) ===================================== -->
+<!-- ============================================================ -->
+<div id="view-messages">
 
 <!-- ===== Stat strip ===== -->
 <section class="px-6 py-5 relative z-10">
@@ -207,6 +227,9 @@ const HTML = /* html */ `<!DOCTYPE html>
         <button data-filter="failed" class="seg-btn px-5 py-2.5 rounded-lg text-sm font-medium">Failed  <span class="count" id="cnt-failed">0</span></button>
         <button data-filter="bulk"   class="seg-btn px-5 py-2.5 rounded-lg text-sm font-medium">Bulk    <span class="count" id="cnt-bulk">0</span></button>
       </div>
+      <select id="session-filter" class="bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-xs mono text-neutral-300 hover:border-neutral-700 focus:outline-none focus:border-emerald-500/60 transition-colors">
+        <option value="">All sessions</option>
+      </select>
       <span id="feed-count" class="ml-auto text-xs text-neutral-500 num">0 events</span>
     </div>
 
@@ -224,7 +247,10 @@ const HTML = /* html */ `<!DOCTYPE html>
     <div class="surface rounded-xl flex flex-col overflow-hidden flex-1 min-h-[200px]">
       <div class="px-4 py-3 hairline border-b flex items-center justify-between">
         <div class="text-xs uppercase tracking-[0.14em] text-neutral-500 font-medium">Sessions</div>
-        <span id="sessions-count" class="text-xs text-neutral-500 num bg-neutral-900 px-2 py-0.5 rounded-full">0</span>
+        <div class="flex items-center gap-2">
+          <button id="sessions-refresh" title="Refresh" class="text-neutral-500 hover:text-neutral-200 transition-colors text-xs">⟳</button>
+          <span id="sessions-count" class="text-xs text-neutral-500 num bg-neutral-900 px-2 py-0.5 rounded-full">0</span>
+        </div>
       </div>
       <div id="sessions" class="overflow-auto p-3 space-y-2 text-xs"></div>
     </div>
@@ -239,18 +265,128 @@ const HTML = /* html */ `<!DOCTYPE html>
   </aside>
 </main>
 
+</div>
+<!-- /view-messages -->
+
+<!-- ============================================================ -->
+<!-- VIEW: Network ================================================ -->
+<!-- ============================================================ -->
+<div id="view-network" class="hidden px-6 py-5 relative z-10">
+  <section class="surface rounded-xl flex flex-col overflow-hidden" style="max-height: calc(100vh - 90px); min-height: calc(100vh - 90px);">
+    <div class="p-4 hairline border-b flex items-center gap-3 flex-wrap">
+      <div class="seg rounded-xl p-1 flex gap-1">
+        <button data-net-filter="all"    class="net-btn seg-btn is-active px-5 py-2.5 rounded-lg text-sm font-medium">All     <span class="count" id="cnt-net-all">0</span></button>
+        <button data-net-filter="2xx"    class="net-btn seg-btn px-5 py-2.5 rounded-lg text-sm font-medium">2xx     <span class="count" id="cnt-net-2xx">0</span></button>
+        <button data-net-filter="4xx"    class="net-btn seg-btn px-5 py-2.5 rounded-lg text-sm font-medium">4xx     <span class="count" id="cnt-net-4xx">0</span></button>
+        <button data-net-filter="5xx"    class="net-btn seg-btn px-5 py-2.5 rounded-lg text-sm font-medium">5xx     <span class="count" id="cnt-net-5xx">0</span></button>
+      </div>
+      <label class="flex items-center gap-2 text-xs text-neutral-400 cursor-pointer select-none hover:text-neutral-200 transition-colors">
+        <input id="show-internal" type="checkbox" class="accent-amber-500" />
+        <span>show internal</span>
+        <span id="cnt-internal" class="text-[10px] text-neutral-600 num">(0 hidden)</span>
+      </label>
+      <span id="net-count" class="ml-auto text-xs text-neutral-500 num">0 requests</span>
+    </div>
+    <div id="network" class="flex-1 overflow-auto"></div>
+    <div id="network-empty" class="hidden flex-1 flex flex-col items-center justify-center text-center px-6 py-12">
+      <div class="w-14 h-14 rounded-2xl bg-neutral-900 border border-neutral-800 flex items-center justify-center text-2xl mb-4">🛰️</div>
+      <div class="text-neutral-300 font-medium mb-1">No requests yet</div>
+      <div class="text-sm text-neutral-500">Hit any /v1/* endpoint and the request + response will appear here.</div>
+    </div>
+  </section>
+</div>
+<!-- /view-network -->
+
+<!-- ============================================================ -->
+<!-- VIEW: Sessions =============================================== -->
+<!-- ============================================================ -->
+<div id="view-sessions" class="hidden px-6 py-5 relative z-10">
+  <section class="surface rounded-xl flex flex-col overflow-hidden" style="max-height: calc(100vh - 90px); min-height: calc(100vh - 90px);">
+    <div class="p-4 hairline border-b flex items-center gap-3 flex-wrap">
+      <button id="sess-new" class="bg-emerald-500 hover:bg-emerald-400 text-neutral-950 rounded-lg px-4 py-2 text-sm font-semibold transition-colors flex items-center gap-2">
+        <span class="text-base leading-none">+</span> New session
+      </button>
+      <button id="sess-refresh-tab" class="surface-elev rounded-lg px-3 py-2 text-xs text-neutral-300 hover:text-neutral-100 hover:border-neutral-600 transition-colors">⟳ Refresh</button>
+      <span id="sess-summary" class="ml-auto text-xs text-neutral-500 num"></span>
+    </div>
+    <div id="sess-list" class="flex-1 overflow-auto p-4 grid grid-cols-1 lg:grid-cols-2 gap-3 auto-rows-min"></div>
+    <div id="sess-empty" class="hidden flex-1 flex flex-col items-center justify-center text-center px-6 py-12">
+      <div class="w-14 h-14 rounded-2xl bg-neutral-900 border border-neutral-800 flex items-center justify-center text-2xl mb-4">📱</div>
+      <div class="text-neutral-300 font-medium mb-1">No sessions linked yet</div>
+      <div class="text-sm text-neutral-500 mb-4">Click <strong class="text-neutral-300">+ New session</strong> to generate a sessionId and scan the QR.</div>
+    </div>
+  </section>
+</div>
+<!-- /view-sessions -->
+
+<!-- ============================================================ -->
+<!-- MODAL: New session =========================================== -->
+<!-- ============================================================ -->
+<div id="new-session-modal" class="hidden fixed inset-0 z-40 flex items-center justify-center p-4" style="background: rgba(0,0,0,0.85); backdrop-filter: blur(8px);">
+  <div class="surface-elev rounded-2xl p-7 w-full max-w-lg shadow-2xl">
+    <div class="flex items-start justify-between mb-1">
+      <h2 class="text-xl font-semibold">New session</h2>
+      <button id="ns-close" class="text-neutral-500 hover:text-neutral-200 transition-colors text-lg leading-none">×</button>
+    </div>
+    <p class="text-sm text-neutral-400 mb-5">Generate (or paste) a session UUID, then scan the QR with WhatsApp on your phone.</p>
+
+    <!-- Step 1: choose id -->
+    <div id="ns-step-id">
+      <label class="block text-xs uppercase tracking-wider text-neutral-500 mb-2">Session ID</label>
+      <div class="flex gap-2">
+        <input id="ns-id" type="text" autocomplete="off"
+               class="flex-1 bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 mono text-sm focus:outline-none focus:border-emerald-500/60 transition-colors" />
+        <button id="ns-gen" class="surface-elev rounded-lg px-3 py-2 text-xs text-neutral-300 hover:text-neutral-100">Regenerate</button>
+      </div>
+      <p class="text-[11px] text-neutral-500 mt-2">Must be a UUID. Anything that identifies this session uniquely — the worker treats it as an opaque key.</p>
+      <button id="ns-submit" class="mt-5 w-full bg-emerald-500 hover:bg-emerald-400 text-neutral-950 rounded-lg py-2.5 text-sm font-semibold transition-colors">Start linking</button>
+    </div>
+
+    <!-- Step 2: waiting for QR / scanning -->
+    <div id="ns-step-qr" class="hidden text-center">
+      <div id="ns-status-line" class="text-sm text-neutral-300 mb-3">Booting Chromium…</div>
+      <div id="ns-qr-wrap" class="hidden inline-block p-4 bg-white rounded-xl">
+        <img id="ns-qr-img" alt="QR code" class="block" width="280" height="280" />
+      </div>
+      <div class="mt-4 text-xs text-neutral-500">Open WhatsApp → Settings → Linked Devices → Link a device, and scan.</div>
+      <button id="ns-cancel" class="mt-5 surface-elev rounded-lg px-4 py-2 text-xs text-neutral-300 hover:text-neutral-100">Cancel</button>
+    </div>
+
+    <!-- Step 3: ready -->
+    <div id="ns-step-ready" class="hidden text-center">
+      <div class="w-16 h-16 rounded-full bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center mx-auto mb-3 text-emerald-400 text-3xl">✓</div>
+      <div class="text-base font-semibold text-neutral-100 mb-1">Linked</div>
+      <div id="ns-ready-phone" class="text-sm text-neutral-400 mono mb-5"></div>
+      <button id="ns-done" class="bg-emerald-500 hover:bg-emerald-400 text-neutral-950 rounded-lg px-5 py-2 text-sm font-semibold">Done</button>
+    </div>
+
+    <!-- Step error -->
+    <div id="ns-step-error" class="hidden text-center">
+      <div class="w-16 h-16 rounded-full bg-rose-500/15 border border-rose-500/30 flex items-center justify-center mx-auto mb-3 text-rose-400 text-3xl">!</div>
+      <div class="text-base font-semibold text-neutral-100 mb-2">Couldn't link</div>
+      <div id="ns-error-msg" class="text-sm text-rose-300 mb-5"></div>
+      <button id="ns-error-back" class="surface-elev rounded-lg px-4 py-2 text-xs text-neutral-300 hover:text-neutral-100">Back</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const MAX_FEED = 500;
-const POLL_INTERVAL_MS = 5000;
+const MAX_NET = 300;
 const THROUGHPUT_WINDOW_MS = 60_000;
 
 let secret = sessionStorage.getItem('worker-secret') || '';
 let reveal = false;
 let currentFilter = 'all';
+let currentMode = 'messages';      // 'messages' | 'network' | 'sessions'
+let currentNetFilter = 'all';      // 'all' | '2xx' | '4xx' | '5xx'
+let currentSessionFilter = '';     // '' = all sessions, otherwise sessionId
+let showInternal = false;          // hide dashboard-originated traffic by default
 const counters = { sent: 0, failed: 0 };
 const recentSendTimestamps = [];
 const allMessages = [];
+const allRequests = [];
 
 const LOCAL_CACHE_KEY = 'worker-dashboard-messages';
 const LOCAL_CACHE_LIMIT = 500;
@@ -326,11 +462,40 @@ function updateFilterCounts() {
 // ---------- message rendering ----------
 
 function eventMatchesFilter(ev) {
+  if (currentSessionFilter) {
+    const sid = ev.data && ev.data.sessionId;
+    if (sid !== currentSessionFilter) return false;
+  }
   if (currentFilter === 'all') return true;
   if (currentFilter === 'sent')   return ev.type === 'message.sent';
   if (currentFilter === 'failed') return ev.type === 'message.failed';
   if (currentFilter === 'bulk')   return ev.type.startsWith('bulk.');
   return true;
+}
+
+function updateSessionFilterOptions() {
+  const sel = $('session-filter');
+  if (!sel) return;
+  const current = sel.value;
+  // Only sessions with a linked phone number are filter-able — an unlinked
+  // session has no messages worth filtering to. Sort phone numbers
+  // alphabetically for stable ordering.
+  const linked = lastSessions
+    .filter((s) => !!s.phoneNumber)
+    .sort((a, b) => String(a.phoneNumber).localeCompare(String(b.phoneNumber)));
+  let html = '<option value="">All sessions</option>';
+  for (const s of linked) {
+    html += '<option value="' + s.sessionId + '">' + maskPhone(s.phoneNumber) + '</option>';
+  }
+  sel.innerHTML = html;
+  // Preserve current selection if it still exists; otherwise reset to all.
+  if (current && linked.some((s) => s.sessionId === current)) {
+    sel.value = current;
+  } else if (current) {
+    sel.value = '';
+    currentSessionFilter = '';
+    rerenderFeed();
+  }
 }
 
 function renderMessageRow(ev) {
@@ -359,6 +524,13 @@ function renderMessageRow(ev) {
     isBulkC  ? '<span class="text-amber-300">Bulk done</span>' :
     '<span class="text-neutral-400">' + ev.type + '</span>';
 
+  // OVERRIDE badge — every message.* / bulk.* event the worker emits with
+  // override:true gets a vivid pill so the operator can see at a glance
+  // when a send bypassed all anti-ban gates. High signal, low frequency.
+  const overrideBadge = d.override === true
+    ? '<span class="ml-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider bg-rose-500/20 border border-rose-500/40 text-rose-300" title="Sent with X-Worker-Override — anti-ban gates bypassed">⚠ Override</span>'
+    : '';
+
   // Primary line (the headline of the row)
   let headline = '';
   if (isSent || isFailed) {
@@ -378,15 +550,27 @@ function renderMessageRow(ev) {
   if (isSent && d.messageId)   chips.push('<span class="meta-chip text-neutral-400 hover:text-neutral-200" data-copy="' + d.messageId + '" title="' + d.messageId + ' — click to copy">msg ' + shortId(d.messageId, 12) + '</span>');
   if (isFailed && d.reason)    chips.push('<span class="text-rose-300/80 text-[11px]">' + d.reason + '</span>');
 
+  // Message body — shown for sent/failed events for debugging. The body is
+  // already gated by the worker secret (only auth'd dashboard subscribers
+  // see it) so no further redaction.
+  let bodyBlock = '';
+  if ((isSent || isFailed) && typeof d.body === 'string' && d.body.length > 0) {
+    const truncated = d.body.length > 600 ? d.body.slice(0, 600) + '…' : d.body;
+    const escaped = truncated.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    bodyBlock =
+      '    <div class="mt-2 pl-3 border-l-2 border-neutral-800 text-[13px] text-neutral-300 whitespace-pre-wrap break-words">' + escaped + '</div>';
+  }
+
   row.innerHTML =
     '<div class="flex items-start gap-4">' +
     '  <div class="bubble ' + bubbleCls + '">' + bubbleIcon + '</div>' +
     '  <div class="flex-1 min-w-0">' +
     '    <div class="flex items-baseline gap-3 flex-wrap">' +
-    '      <div class="text-xs font-semibold uppercase tracking-wide">' + statusLabel + '</div>' +
+    '      <div class="text-xs font-semibold uppercase tracking-wide">' + statusLabel + overrideBadge + '</div>' +
     '      <div class="flex-1 truncate min-w-0">' + headline + '</div>' +
     '      <div class="text-[11px] text-neutral-500 num shrink-0">' + timeStr(ev.ts) + '</div>' +
     '    </div>' +
+    bodyBlock +
     (chips.length ? '    <div class="mt-2 flex flex-wrap gap-2 text-[11px] mono">' + chips.join('') + '</div>' : '') +
     '  </div>' +
     '</div>';
@@ -405,10 +589,20 @@ function renderMessageRow(ev) {
   return row;
 }
 
+// Track which events are already rendered so live SSE events + ring-buffer
+// replays + /events/recent + localStorage cache don't double-render.
+const seenKeys = new Set();
+
 function appendMessage(ev) {
+  const k = eventKey(ev);
+  if (seenKeys.has(k)) return false;
+  seenKeys.add(k);
   allMessages.unshift(ev);
-  while (allMessages.length > MAX_FEED) allMessages.pop();
-  if (!eventMatchesFilter(ev)) { updateFeedCount(); updateFilterCounts(); return; }
+  while (allMessages.length > MAX_FEED) {
+    const dropped = allMessages.pop();
+    if (dropped) seenKeys.delete(eventKey(dropped));
+  }
+  if (!eventMatchesFilter(ev)) { updateFeedCount(); updateFilterCounts(); return true; }
   const row = renderMessageRow(ev);
   const feed = $('messages');
   feed.prepend(row);
@@ -416,6 +610,7 @@ function appendMessage(ev) {
   $('messages-empty').classList.toggle('hidden', feed.children.length > 0);
   updateFeedCount();
   updateFilterCounts();
+  return true;
 }
 
 function rerenderFeed() {
@@ -453,7 +648,16 @@ function renderSystemRow(ev) {
   return row;
 }
 
+const seenSystemKeys = new Set();
 function appendSystem(ev) {
+  const k = eventKey(ev);
+  if (seenSystemKeys.has(k)) return;
+  seenSystemKeys.add(k);
+  if (seenSystemKeys.size > 200) {
+    // Cap memory: drop arbitrary 50 keys when the set grows large. Cheap
+    // approximation of LRU — events are evicted from the DOM at 80 anyway.
+    let i = 0; for (const old of seenSystemKeys) { if (i++ >= 50) break; seenSystemKeys.delete(old); }
+  }
   const box = $('system'); box.prepend(renderSystemRow(ev));
   while (box.children.length > 80) box.lastChild.remove();
 }
@@ -495,31 +699,232 @@ function renderSessions() {
   }
 }
 
+// ---------- network panel ----------
+
+function statusBucket(code) {
+  if (code >= 500) return '5xx';
+  if (code >= 400) return '4xx';
+  if (code >= 200 && code < 300) return '2xx';
+  return 'other';
+}
+
+function statusColour(code) {
+  if (code >= 500) return 'text-rose-400';
+  if (code >= 400) return 'text-amber-400';
+  if (code >= 300) return 'text-sky-400';
+  if (code >= 200) return 'text-emerald-400';
+  return 'text-neutral-400';
+}
+
+function methodColour(m) {
+  switch (m) {
+    case 'GET':    return 'text-sky-300';
+    case 'POST':   return 'text-emerald-300';
+    case 'PUT':    return 'text-amber-300';
+    case 'PATCH':  return 'text-amber-300';
+    case 'DELETE': return 'text-rose-300';
+    default:       return 'text-neutral-300';
+  }
+}
+
+function prettyJson(text) {
+  if (!text) return '';
+  try { return JSON.stringify(JSON.parse(text), null, 2); } catch { return text; }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function netMatchesFilter(req) {
+  if (req.internal && !showInternal) return false;
+  if (currentNetFilter === 'all') return true;
+  return statusBucket(req.status) === currentNetFilter;
+}
+
+function renderNetworkRow(req) {
+  const wrap = document.createElement('div');
+  wrap.className = 'row hairline border-b';
+
+  const sc = statusColour(req.status);
+  const mc = methodColour(req.method);
+  const slow = req.latencyMs > 1000;
+
+  const summary = document.createElement('div');
+  summary.className = 'px-5 py-3 flex items-center gap-4 cursor-pointer hover:bg-white/[0.02] transition-colors';
+  summary.innerHTML =
+    '<span class="' + sc + ' num font-semibold w-12 shrink-0">' + req.status + '</span>' +
+    '<span class="' + mc + ' mono text-[12px] w-16 shrink-0 font-semibold">' + req.method + '</span>' +
+    '<span class="mono text-[13px] text-neutral-200 flex-1 truncate min-w-0">' + escapeHtml(req.path) + '</span>' +
+    '<span class="num text-[12px] ' + (slow ? 'text-amber-400' : 'text-neutral-500') + ' shrink-0">' + req.latencyMs + 'ms</span>' +
+    '<span class="text-[11px] text-neutral-500 num shrink-0">' + timeStr(req.ts) + '</span>' +
+    '<span class="text-neutral-600 text-xs shrink-0">▸</span>';
+
+  const detail = document.createElement('div');
+  detail.className = 'hidden px-5 pb-4 grid grid-cols-1 lg:grid-cols-2 gap-4 text-[12px]';
+
+  const headersBlock = req.reqHeaders
+    ? Object.entries(req.reqHeaders).map(([k, v]) => '<div class="mono"><span class="text-neutral-500">' + escapeHtml(k) + ':</span> <span class="text-neutral-300">' + escapeHtml(typeof v === 'string' ? v : JSON.stringify(v)) + '</span></div>').join('')
+    : '<div class="text-neutral-600 italic">(none)</div>';
+
+  const reqBodyText = req.reqBody ? escapeHtml(prettyJson(req.reqBody)) + (req.reqBodyTruncated ? '\\n…(truncated)' : '') : '';
+  const resBodyText = req.resBody ? escapeHtml(prettyJson(req.resBody)) + (req.resBodyTruncated ? '\\n…(truncated)' : '') : '';
+
+  detail.innerHTML =
+    '<div class="surface-elev rounded-lg p-3">' +
+    '  <div class="text-[10px] uppercase tracking-wider text-neutral-500 mb-2 font-medium">Request headers</div>' +
+    '  <div class="space-y-0.5 max-h-48 overflow-auto">' + headersBlock + '</div>' +
+    '  <div class="text-[10px] uppercase tracking-wider text-neutral-500 mt-3 mb-2 font-medium">Request body</div>' +
+    '  <pre class="mono text-[11px] text-neutral-300 whitespace-pre-wrap break-words max-h-48 overflow-auto">' + (reqBodyText || '<span class="text-neutral-600 italic">(empty)</span>') + '</pre>' +
+    '</div>' +
+    '<div class="surface-elev rounded-lg p-3">' +
+    '  <div class="text-[10px] uppercase tracking-wider text-neutral-500 mb-2 font-medium">Response</div>' +
+    '  <div class="mono text-[11px] space-y-0.5">' +
+    '    <div><span class="text-neutral-500">status:</span> <span class="' + sc + '">' + req.status + '</span></div>' +
+    '    <div><span class="text-neutral-500">content-type:</span> <span class="text-neutral-300">' + escapeHtml(String(req.contentType ?? '')) + '</span></div>' +
+    '    <div><span class="text-neutral-500">latency:</span> <span class="' + (slow ? 'text-amber-400' : 'text-neutral-300') + '">' + req.latencyMs + 'ms</span></div>' +
+    '    <div><span class="text-neutral-500">requestId:</span> <span class="text-neutral-300" data-copy="' + escapeHtml(req.requestId ?? '') + '">' + escapeHtml(req.requestId ?? '') + '</span></div>' +
+    '    <div><span class="text-neutral-500">ip:</span> <span class="text-neutral-300">' + escapeHtml(String(req.ip ?? '')) + '</span></div>' +
+    '  </div>' +
+    '  <div class="text-[10px] uppercase tracking-wider text-neutral-500 mt-3 mb-2 font-medium">Response body</div>' +
+    '  <pre class="mono text-[11px] text-neutral-300 whitespace-pre-wrap break-words max-h-48 overflow-auto">' + (resBodyText || '<span class="text-neutral-600 italic">(empty)</span>') + '</pre>' +
+    '</div>';
+
+  summary.addEventListener('click', () => {
+    detail.classList.toggle('hidden');
+    const caret = summary.lastChild;
+    if (caret && caret.textContent) caret.textContent = detail.classList.contains('hidden') ? '▸' : '▾';
+  });
+
+  wrap.appendChild(summary);
+  wrap.appendChild(detail);
+  return wrap;
+}
+
+const seenReqKeys = new Set();
+function reqKey(r) {
+  return (r.requestId ?? '') + '|' + r.ts + '|' + r.method + '|' + r.path;
+}
+
+function appendRequest(req) {
+  const k = reqKey(req);
+  if (seenReqKeys.has(k)) return false;
+  seenReqKeys.add(k);
+  allRequests.unshift(req);
+  while (allRequests.length > MAX_NET) {
+    const dropped = allRequests.pop();
+    if (dropped) seenReqKeys.delete(reqKey(dropped));
+  }
+  updateNetCounts();
+  if (!netMatchesFilter(req)) return true;
+  const row = renderNetworkRow(req);
+  const feed = $('network');
+  feed.prepend(row);
+  while (feed.children.length > MAX_NET) feed.lastChild.remove();
+  $('network-empty').classList.toggle('hidden', feed.children.length > 0);
+  return true;
+}
+
+function rerenderNetwork() {
+  const feed = $('network'); feed.innerHTML = '';
+  for (const r of allRequests) {
+    if (!netMatchesFilter(r)) continue;
+    feed.appendChild(renderNetworkRow(r));
+  }
+  $('network-empty').classList.toggle('hidden', feed.children.length > 0);
+  updateNetCounts();
+}
+
+function updateNetCounts() {
+  let n2 = 0, n4 = 0, n5 = 0, nInternal = 0;
+  for (const r of allRequests) {
+    if (r.internal) nInternal++;
+    if (r.internal && !showInternal) continue;
+    const b = statusBucket(r.status);
+    if (b === '2xx') n2++; else if (b === '4xx') n4++; else if (b === '5xx') n5++;
+  }
+  const visibleTotal = showInternal ? allRequests.length : allRequests.length - nInternal;
+  $('cnt-net').textContent     = visibleTotal;
+  $('cnt-net-all').textContent = visibleTotal;
+  $('cnt-net-2xx').textContent = n2;
+  $('cnt-net-4xx').textContent = n4;
+  $('cnt-net-5xx').textContent = n5;
+  $('cnt-internal').textContent = '(' + nInternal + ' hidden)';
+  const visible = allRequests.filter(netMatchesFilter).length;
+  $('net-count').textContent = visible + (visible === 1 ? ' request' : ' requests');
+}
+
 // ---------- dispatcher ----------
 
 function handleEvent(ev) {
-  if (ev.type === 'message.sent') { counters.sent++; if (!ev.replay) recentSendTimestamps.push(Date.now()); appendMessage(ev); }
-  else if (ev.type === 'message.failed') { counters.failed++; appendMessage(ev); }
-  else if (ev.type === 'bulk.started' || ev.type === 'bulk.completed') { appendMessage(ev); }
-  else if (ev.type.startsWith('session.')) { appendSystem(ev); }
+  if (ev.type === 'message.sent') {
+    if (appendMessage(ev)) { counters.sent++; if (!ev.replay) recentSendTimestamps.push(Date.now()); }
+  } else if (ev.type === 'message.failed') {
+    if (appendMessage(ev)) counters.failed++;
+  } else if (ev.type === 'bulk.started' || ev.type === 'bulk.completed') {
+    appendMessage(ev);
+  } else if (ev.type === 'http.request') {
+    appendRequest({ ...ev.data, ts: ev.ts });
+  } else if (ev.type.startsWith('session.')) {
+    appendSystem(ev);
+    applySessionEvent(ev);
+  }
   updateCounters();
+}
+
+// Apply a session.* event to the in-memory lastSessions array so the
+// Sessions tab and sidebar update live without polling. The worker
+// publishes enriched payloads (status / qrDataUrl / phoneNumber /
+// lastActivity), so we just splice the row in/out and re-render.
+function applySessionEvent(ev) {
+  const d = ev.data || {};
+  const sid = d.sessionId;
+  if (!sid) return;
+
+  if (ev.type === 'session.deleted') {
+    const idx = lastSessions.findIndex((s) => s.sessionId === sid);
+    if (idx >= 0) lastSessions.splice(idx, 1);
+    expandedSessions.delete(sid);
+  } else if (typeof d.status === 'string') {
+    const row = {
+      sessionId:    sid,
+      status:       d.status,
+      qrDataUrl:    d.qrDataUrl ?? null,
+      phoneNumber:  d.phoneNumber ?? null,
+      lastActivity: d.lastActivity ?? ev.ts,
+      // readySince is set by the server on session.ready and cleared by the
+      // server when leaving ready. On non-ready events the payload omits it
+      // (so the server-side null isn't on the wire); explicitly null it out
+      // here so the "connected for" pill disappears when the status flips.
+      readySince:   d.status === 'ready' ? (d.readySince ?? null) : null,
+    };
+    const idx = lastSessions.findIndex((s) => s.sessionId === sid);
+    if (idx >= 0) lastSessions[idx] = { ...lastSessions[idx], ...row };
+    else lastSessions.push(row);
+  }
+
+  renderSessions();          // sidebar in Messages view
+  renderSessionsTab();       // dedicated Sessions tab
+  updateSessionFilterOptions();
 }
 
 // ---------- fetching ----------
 
 async function refreshSessions() {
   try {
-    const r = await fetch('/v1/sessions?limit=200', { headers: { 'X-Worker-Secret': secret } });
+    const r = await fetch('/v1/sessions?limit=200', { headers: { 'X-Worker-Secret': secret, 'X-Dashboard-Internal': '1' } });
     if (!r.ok) { if (r.status === 401) promptForSecret(); return; }
     const body = await r.json();
     lastSessions = body.sessions || [];
     renderSessions();
+    if (currentMode === 'sessions') renderSessionsTab();
+    updateSessionFilterOptions();
   } catch (err) { console.warn('refreshSessions:', err); }
 }
 
 async function fetchRecent() {
   try {
-    const r = await fetch('/events/recent?limit=500', { headers: { 'X-Worker-Secret': secret } });
+    const r = await fetch('/events/recent?limit=500', { headers: { 'X-Worker-Secret': secret, 'X-Dashboard-Internal': '1' } });
     if (!r.ok) return [];
     const body = await r.json();
     return Array.isArray(body.events) ? body.events : [];
@@ -527,17 +932,19 @@ async function fetchRecent() {
 }
 
 function mergeAndRender(events) {
-  const seen = new Set(allMessages.map(eventKey));
   for (const ev of events) {
     const k = eventKey(ev);
-    if (seen.has(k)) continue;
-    seen.add(k);
+    if (seenKeys.has(k)) continue;
+    seenKeys.add(k);
     allMessages.push({ ...ev, replay: true });
     if (ev.type === 'message.sent')   counters.sent++;
     if (ev.type === 'message.failed') counters.failed++;
   }
   allMessages.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
-  while (allMessages.length > MAX_FEED) allMessages.pop();
+  while (allMessages.length > MAX_FEED) {
+    const dropped = allMessages.pop();
+    if (dropped) seenKeys.delete(eventKey(dropped));
+  }
   rerenderFeed();
   updateCounters();
 }
@@ -547,7 +954,7 @@ async function streamEvents() {
   setStatus('connecting…', 'bg-neutral-500', 'text-neutral-400');
 
   let response;
-  try { response = await fetch('/events', { headers: { 'X-Worker-Secret': secret } }); }
+  try { response = await fetch('/events', { headers: { 'X-Worker-Secret': secret, 'X-Dashboard-Internal': '1' } }); }
   catch { setStatus('disconnected', 'bg-rose-500', 'text-rose-300'); setTimeout(streamEvents, 3000); return; }
 
   if (!response.ok) {
@@ -606,10 +1013,19 @@ $('reveal').addEventListener('change', (e) => {
   reveal = e.target.checked;
   rerenderFeed();
   renderSessions();
+  renderSessionsTab();
+  updateSessionFilterOptions();
 });
 
 $('clear-feed').addEventListener('click', () => {
+  if (currentMode === 'network') {
+    allRequests.length = 0;
+    seenReqKeys.clear();
+    rerenderNetwork();
+    return;
+  }
   allMessages.length = 0;
+  seenKeys.clear();
   counters.sent = 0; counters.failed = 0;
   recentSendTimestamps.length = 0;
   localStorage.removeItem(LOCAL_CACHE_KEY);
@@ -617,24 +1033,400 @@ $('clear-feed').addEventListener('click', () => {
   updateCounters();
 });
 
-for (const btn of document.querySelectorAll('.seg-btn')) {
+// Message filter (All / Sent / Failed / Bulk)
+for (const btn of document.querySelectorAll('.seg-btn[data-filter]')) {
   btn.addEventListener('click', () => {
     currentFilter = btn.dataset.filter;
-    for (const b of document.querySelectorAll('.seg-btn')) b.classList.remove('is-active');
+    for (const b of document.querySelectorAll('.seg-btn[data-filter]')) b.classList.remove('is-active');
     btn.classList.add('is-active');
     rerenderFeed();
   });
 }
 
+// Session filter dropdown
+$('session-filter').addEventListener('change', (e) => {
+  currentSessionFilter = e.target.value;
+  rerenderFeed();
+});
+
+// Network status filter (All / 2xx / 4xx / 5xx)
+for (const btn of document.querySelectorAll('.net-btn[data-net-filter]')) {
+  btn.addEventListener('click', () => {
+    currentNetFilter = btn.dataset.netFilter;
+    for (const b of document.querySelectorAll('.net-btn[data-net-filter]')) b.classList.remove('is-active');
+    btn.classList.add('is-active');
+    rerenderNetwork();
+  });
+}
+
+// Show internal toggle — hides/shows dashboard's own polling fetches.
+$('show-internal').addEventListener('change', (e) => {
+  showInternal = e.target.checked;
+  rerenderNetwork();
+});
+
+// View mode (Messages / Network / Sessions)
+function setMode(mode) {
+  currentMode = mode;
+  for (const b of document.querySelectorAll('.mode-btn[data-mode]')) b.classList.remove('is-active');
+  document.querySelector('.mode-btn[data-mode="' + mode + '"]').classList.add('is-active');
+  $('view-messages').classList.toggle('hidden', mode !== 'messages');
+  $('view-network').classList.toggle('hidden',  mode !== 'network');
+  $('view-sessions').classList.toggle('hidden', mode !== 'sessions');
+  if (mode === 'sessions') renderSessionsTab();
+}
+for (const btn of document.querySelectorAll('.mode-btn[data-mode]')) {
+  btn.addEventListener('click', () => setMode(btn.dataset.mode));
+}
+
+// ---------- Sessions management tab ----------
+
+const INTERNAL_HEADERS = () => ({ 'X-Worker-Secret': secret, 'X-Dashboard-Internal': '1' });
+
+// ---------- uptime ticker ----------
+
+let workerStartedAtMs = null;  // computed from /health on connect
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '—';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  const sr = s % 60;
+  if (m < 60) return m + 'm ' + sr + 's';
+  const h = Math.floor(m / 60);
+  const mr = m % 60;
+  if (h < 24) return h + 'h ' + mr + 'm';
+  const d = Math.floor(h / 24);
+  const hr = h % 24;
+  return d + 'd ' + hr + 'h';
+}
+
+async function fetchWorkerUptime() {
+  // /health is public — no auth header needed. Returns { ok, uptime } in seconds.
+  try {
+    const r = await fetch('/health', { headers: { 'X-Dashboard-Internal': '1' } });
+    if (!r.ok) return;
+    const body = await r.json();
+    if (typeof body.uptime === 'number') {
+      workerStartedAtMs = Date.now() - body.uptime * 1000;
+    }
+  } catch {}
+}
+
+// Single live-tick interval drives BOTH the worker-uptime header pill AND the
+// per-session "connected for" labels in the Sessions tab. Cheap: we mutate
+// textContent on a handful of DOM nodes; no full re-render.
+function tickUptimes() {
+  if (workerStartedAtMs !== null) {
+    $('worker-uptime').textContent = formatDuration(Date.now() - workerStartedAtMs);
+  }
+  for (const el of document.querySelectorAll('[data-ready-since]')) {
+    const since = Number(el.dataset.readySince);
+    if (!Number.isFinite(since) || since <= 0) continue;
+    el.textContent = formatDuration(Date.now() - since);
+  }
+}
+setInterval(tickUptimes, 1000);
+
+function relTime(iso) {
+  if (!iso) return '—';
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms)) return '—';
+  const s = Math.floor(ms / 1000);
+  if (s < 60)   return s + 's ago';
+  const m = Math.floor(s / 60);
+  if (m < 60)   return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 24)   return h + 'h ago';
+  const d = Math.floor(h / 24);
+  return d + 'd ago';
+}
+
+function statusBadge(status) {
+  const map = {
+    ready:        { dot: 'bg-emerald-400', text: 'text-emerald-400', bg: 'bg-emerald-500/10', label: 'ready' },
+    qr_pending:   { dot: 'bg-amber-400',   text: 'text-amber-400',   bg: 'bg-amber-500/10',   label: 'qr pending' },
+    connecting:   { dot: 'bg-sky-400',     text: 'text-sky-400',     bg: 'bg-sky-500/10',     label: 'connecting' },
+    disconnected: { dot: 'bg-neutral-500', text: 'text-neutral-400', bg: 'bg-neutral-800',    label: 'disconnected' },
+  };
+  const s = map[status] ?? map.disconnected;
+  return '<span class="' + s.bg + ' ' + s.text + ' inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium">'
+    + '<span class="dot ' + s.dot + '"></span>' + s.label + '</span>';
+}
+
+// Track which session card is expanded (by sessionId), so re-renders preserve it.
+const expandedSessions = new Set();
+
+function renderSessionsTab() {
+  const list = $('sess-list');
+  const empty = $('sess-empty');
+  const summary = $('sess-summary');
+  const ready = lastSessions.filter((s) => s.status === 'ready').length;
+  $('cnt-sess').textContent = lastSessions.length;
+  summary.textContent = lastSessions.length + ' total · ' + ready + ' ready';
+
+  if (lastSessions.length === 0) {
+    list.innerHTML = '';
+    empty.classList.remove('hidden');
+    return;
+  }
+  empty.classList.add('hidden');
+  list.innerHTML = '';
+
+  for (const s of lastSessions) {
+    const card = document.createElement('div');
+    card.className = 'surface-elev rounded-xl overflow-hidden';
+    const sid = s.sessionId;
+    const isExpanded = expandedSessions.has(sid);
+
+    const header = document.createElement('div');
+    header.className = 'p-4 cursor-pointer hover:bg-white/[0.02] transition-colors';
+    header.innerHTML =
+      '<div class="flex items-start justify-between gap-3 mb-2">' +
+      '  ' + statusBadge(s.status) +
+      '  <div class="text-[11px] text-neutral-500 num shrink-0">' + relTime(s.lastActivity) + '</div>' +
+      '</div>' +
+      '<div class="mono text-[12px] text-neutral-300 truncate">' + sid + '</div>' +
+      (s.phoneNumber
+        ? '<div class="mt-1 mono text-[12px] text-neutral-500">' + maskPhone(s.phoneNumber) + '</div>'
+        : '<div class="mt-1 text-[11px] text-neutral-600 italic">no phone linked yet</div>') +
+      // Connected-for indicator. Only shown for ready sessions; the live
+      // value ticks via data-ready-since (see tickUptimes). readySince comes
+      // from the server (set on the "ready" event, cleared on disconnect).
+      (s.status === 'ready' && s.readySince
+        ? '<div class="mt-2 flex items-center gap-1.5 text-[11px] text-emerald-400/80">' +
+          '  <span class="text-neutral-600 uppercase tracking-wider text-[9px]">connected</span>' +
+          '  <span class="num" data-ready-since="' + new Date(s.readySince).getTime() + '">—</span>' +
+          '</div>'
+        : '');
+
+    const detail = document.createElement('div');
+    detail.className = 'hairline border-t px-4 py-3 space-y-3' + (isExpanded ? '' : ' hidden');
+
+    // QR (qr_pending only)
+    const qrBlock = (s.status === 'qr_pending' && s.qrDataUrl)
+      ? '<div class="text-center">' +
+        '  <div class="text-[10px] uppercase tracking-wider text-neutral-500 mb-2">Scan with WhatsApp</div>' +
+        '  <div class="inline-block p-3 bg-white rounded-lg"><img src="' + s.qrDataUrl + '" alt="QR" width="200" height="200" class="block"/></div>' +
+        '</div>'
+      : '';
+
+    detail.innerHTML =
+      qrBlock +
+      '<div class="grid grid-cols-2 gap-2 text-[11px]">' +
+      '  <div><div class="text-neutral-500">last activity</div><div class="text-neutral-300 mono">' + (s.lastActivity || '—') + '</div></div>' +
+      '  <div><div class="text-neutral-500">phone</div><div class="text-neutral-300 mono">' + (s.phoneNumber ? maskPhone(s.phoneNumber) : '—') + '</div></div>' +
+      '</div>' +
+      '<div class="flex gap-2 pt-1 flex-wrap">' +
+      '  <button data-act="refresh" data-sid="' + sid + '" class="surface-elev rounded-md px-3 py-1.5 text-xs text-neutral-300 hover:text-neutral-100">⟳ Refresh</button>' +
+      (s.status === 'disconnected'
+        ? '  <button data-act="reconnect" data-sid="' + sid + '" class="bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 rounded-md px-3 py-1.5 text-xs text-emerald-300 hover:text-emerald-200">⤴ Reconnect</button>'
+        : '') +
+      '  <button data-act="copy"    data-sid="' + sid + '" class="surface-elev rounded-md px-3 py-1.5 text-xs text-neutral-300 hover:text-neutral-100">Copy ID</button>' +
+      '  <button data-act="delete"  data-sid="' + sid + '" class="ml-auto bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 rounded-md px-3 py-1.5 text-xs text-rose-300 hover:text-rose-200">Delete</button>' +
+      '</div>';
+
+    header.addEventListener('click', () => {
+      if (expandedSessions.has(sid)) { expandedSessions.delete(sid); detail.classList.add('hidden'); }
+      else { expandedSessions.add(sid); detail.classList.remove('hidden'); }
+    });
+
+    detail.addEventListener('click', async (ev) => {
+      const btn = ev.target.closest('[data-act]');
+      if (!btn) return;
+      const id = btn.dataset.sid;
+      if (btn.dataset.act === 'copy') return copyToClipboard(id, btn);
+      if (btn.dataset.act === 'refresh') return refreshOneSession(id);
+      if (btn.dataset.act === 'delete') return deleteSessionWithConfirm(id);
+      if (btn.dataset.act === 'reconnect') return reconnectSession(id, btn);
+    });
+
+    card.appendChild(header);
+    card.appendChild(detail);
+    list.appendChild(card);
+  }
+}
+
+// Reconnect a disconnected session. POSTing /v1/sessions/:id on a session
+// that exists in-memory as "disconnected" triggers a server-side forced
+// reinit (bypasses the 15min ban-safety cooldown for explicit operator
+// action; in-flight lock still applies). Disables the button while the
+// request is in flight, then polls the session for ~30s to surface the
+// status flip back to "ready" (or "qr_pending" if WhatsApp rejected the
+// blob).
+async function reconnectSession(sid, btn) {
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.style.opacity = '0.5';
+  btn.textContent = 'Reconnecting…';
+  try {
+    const r = await fetch('/v1/sessions/' + encodeURIComponent(sid), {
+      method: 'POST',
+      headers: INTERNAL_HEADERS(),
+    });
+    if (!r.ok) {
+      btn.textContent = 'Failed (' + r.status + ')';
+      setTimeout(() => { btn.textContent = original; btn.disabled = false; btn.style.opacity = ''; }, 3000);
+      return;
+    }
+    // Poll the session for ~30s to surface the status flip live in the UI.
+    // The server emits session.* events too, so applySessionEvent will also
+    // catch the change — but polling is robust if the SSE happens to be
+    // mid-reconnect.
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const fresh = await fetch('/v1/sessions/' + encodeURIComponent(sid), { headers: INTERNAL_HEADERS() });
+      if (!fresh.ok) continue;
+      const body = await fresh.json();
+      const status = body.session?.status;
+      if (status === 'ready' || status === 'qr_pending') break;
+    }
+    await refreshSessions();
+    renderSessionsTab();
+  } catch (err) {
+    btn.textContent = 'Failed';
+    setTimeout(() => { btn.textContent = original; btn.disabled = false; btn.style.opacity = ''; }, 3000);
+  }
+}
+
+async function refreshOneSession(sid) {
+  try {
+    const r = await fetch('/v1/sessions/' + encodeURIComponent(sid), { headers: INTERNAL_HEADERS() });
+    if (!r.ok) return;
+    const body = await r.json();
+    if (!body.session) return;
+    const idx = lastSessions.findIndex((s) => s.sessionId === sid);
+    if (idx >= 0) lastSessions[idx] = body.session; else lastSessions.push(body.session);
+    renderSessionsTab();
+    renderSessions(); // sidebar
+  } catch {}
+}
+
+async function deleteSessionWithConfirm(sid) {
+  if (!confirm('Delete session ' + sid.slice(0, 8) + '… ?\\n\\nThis unlinks the WhatsApp account. The phone will need a new QR scan to re-link.')) return;
+  try {
+    const r = await fetch('/v1/sessions/' + encodeURIComponent(sid), { method: 'DELETE', headers: INTERNAL_HEADERS() });
+    if (!r.ok) { alert('Delete failed (HTTP ' + r.status + ')'); return; }
+    expandedSessions.delete(sid);
+    await refreshSessions();
+    renderSessionsTab();
+  } catch (err) {
+    alert('Delete failed: ' + (err instanceof Error ? err.message : String(err)));
+  }
+}
+
+$('sess-refresh-tab').addEventListener('click', async () => {
+  await refreshSessions();
+  renderSessionsTab();
+});
+
+// ---------- New session modal ----------
+
+let nsPollTimer = null;
+function nsShow(step) {
+  for (const id of ['ns-step-id', 'ns-step-qr', 'ns-step-ready', 'ns-step-error']) {
+    $(id).classList.toggle('hidden', id !== 'ns-step-' + step);
+  }
+}
+function nsOpen() {
+  $('ns-id').value = (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(16));
+  $('ns-error-msg').textContent = '';
+  nsShow('id');
+  $('new-session-modal').classList.remove('hidden');
+  $('ns-id').focus();
+  $('ns-id').select();
+}
+function nsClose() {
+  $('new-session-modal').classList.add('hidden');
+  if (nsPollTimer) { clearInterval(nsPollTimer); nsPollTimer = null; }
+}
+function nsError(msg) {
+  if (nsPollTimer) { clearInterval(nsPollTimer); nsPollTimer = null; }
+  $('ns-error-msg').textContent = msg;
+  nsShow('error');
+}
+async function nsStartLinking() {
+  const sid = $('ns-id').value.trim();
+  if (!sid) { alert('Session ID is required'); return; }
+
+  $('ns-status-line').textContent = 'Booting Chromium…';
+  $('ns-qr-wrap').classList.add('hidden');
+  nsShow('qr');
+
+  try {
+    const r = await fetch('/v1/sessions/' + encodeURIComponent(sid), {
+      method: 'POST',
+      headers: INTERNAL_HEADERS(),
+    });
+    if (!r.ok) { nsError('Init failed (HTTP ' + r.status + ')'); return; }
+  } catch (err) {
+    nsError('Init failed: ' + (err instanceof Error ? err.message : String(err)));
+    return;
+  }
+
+  // Poll for status. Worker emits qrDataUrl when ready to scan; once status
+  // flips to 'ready' we wrap up.
+  nsPollTimer = setInterval(async () => {
+    try {
+      const r = await fetch('/v1/sessions/' + encodeURIComponent(sid), { headers: INTERNAL_HEADERS() });
+      if (!r.ok) return;
+      const body = await r.json();
+      const s = body.session;
+      if (!s) return;
+
+      if (s.status === 'qr_pending' && s.qrDataUrl) {
+        $('ns-status-line').textContent = 'Scan the QR with WhatsApp';
+        $('ns-qr-img').src = s.qrDataUrl;
+        $('ns-qr-wrap').classList.remove('hidden');
+      } else if (s.status === 'connecting') {
+        $('ns-status-line').textContent = 'Connecting…';
+      } else if (s.status === 'ready') {
+        clearInterval(nsPollTimer); nsPollTimer = null;
+        $('ns-ready-phone').textContent = s.phoneNumber ? maskPhone(s.phoneNumber) : '';
+        nsShow('ready');
+        await refreshSessions();
+        renderSessionsTab();
+      } else if (s.status === 'disconnected') {
+        nsError('Session disconnected before scan completed. Try again.');
+      }
+    } catch {}
+  }, 2000);
+}
+
+$('sess-new').addEventListener('click', nsOpen);
+$('ns-close').addEventListener('click', nsClose);
+$('ns-cancel').addEventListener('click', nsClose);
+$('ns-done').addEventListener('click', nsClose);
+$('ns-error-back').addEventListener('click', () => nsShow('id'));
+$('ns-gen').addEventListener('click', () => {
+  $('ns-id').value = (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(16));
+  $('ns-id').focus(); $('ns-id').select();
+});
+$('ns-submit').addEventListener('click', nsStartLinking);
+$('ns-id').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); nsStartLinking(); } });
+
 async function start() {
   const cached = loadCache();
   if (cached.length) mergeAndRender(cached.map((ev) => ({ ...ev, replay: true })));
   fetchRecent().then((events) => { if (events.length) mergeAndRender(events); saveCache(); });
+  // Worker uptime: one-shot fetch of /health gives us the process start
+  // time; tickUptimes() then runs every 1s to update the header label.
+  fetchWorkerUptime();
+  // Sessions sidebar is fetched ONCE on load; thereafter use the manual
+  // refresh button on the Sessions card. Polling was purely cosmetic — the
+  // WhatsApp Web keepalive is owned by Chromium, not the HTTP endpoint.
   refreshSessions();
-  setInterval(refreshSessions, POLL_INTERVAL_MS);
   setInterval(saveCache, 5000);
   streamEvents();
 }
+
+$('sessions-refresh').addEventListener('click', () => {
+  const btn = $('sessions-refresh');
+  btn.style.opacity = '0.4';
+  refreshSessions().finally(() => { btn.style.opacity = ''; });
+});
 
 if (secret) start();
 else promptForSecret();

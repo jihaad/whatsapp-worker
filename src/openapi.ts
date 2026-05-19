@@ -1,14 +1,11 @@
 import { extendZodWithOpenApi, OpenApiGeneratorV3, OpenAPIRegistry } from '@asteasolutions/zod-to-openapi';
 import { z } from 'zod';
-import { QUIET_HOUR_START, QUIET_HOUR_END, QUIET_HOUR_TZ } from './anti-ban';
 import { ErrorResponseSchema } from './lib/errors';
 
 extendZodWithOpenApi(z);
 
 export const registry = new OpenAPIRegistry();
 registry.register('ErrorResponse', ErrorResponseSchema);
-
-const pad = (h: number) => String(h).padStart(2, '0');
 
 // ---------------------------------------------------------------------------
 // Shared schemas
@@ -20,6 +17,7 @@ export const SessionSchema = registry.register('Session', z.object({
   qrDataUrl:    z.string().nullable().openapi({ description: 'Base64 PNG data URL — set only when status is qr_pending' }),
   phoneNumber:  z.string().nullable().openapi({ description: 'Linked phone number once ready' }),
   lastActivity: z.string().openapi({ description: 'ISO 8601 timestamp' }),
+  readySince:   z.string().nullable().openapi({ description: 'ISO 8601 timestamp of when the session most recently entered `ready` state. Null whenever status !== ready. Use to compute connected-for duration.' }),
 }));
 
 // HTTP 200 shape for a single send. The `success` boolean was dropped — the
@@ -58,10 +56,20 @@ export const BulkBatchSchema = registry.register('BulkBatch', z.object({
 // Request schemas (also used for runtime validation in routes)
 // ---------------------------------------------------------------------------
 
+// Override semantics: when set (via body field OR `X-Worker-Override: 1`
+// header), skip all rate-limit/cooldown/quiet-hours/jitter gates. Still
+// secret-gated by the regular auth middleware; logs at warn level on every
+// use; surfaces with an OVERRIDE badge on the dashboard. Auth and the
+// liveness probe still apply — can't send through a dead socket.
+const OverrideField = z.boolean().optional().openapi({
+  description: 'If true, bypass every anti-ban gate (quiet hours, HTTP send rate-limit, per-recipient cooldown, per-account/warmup/global token buckets, inter-message jitter). Auth, liveness probe, and body variation still apply. **High ban risk** — use sparingly for urgent / operational sends. Equivalent to passing the header `X-Worker-Override: 1`.',
+});
+
 export const SendMessageBodySchema = z.object({
   sessionId: z.string().min(1).openapi({ description: 'UUID of the session to send from' }),
   recipient: z.string().min(1).openapi({ description: 'Phone number — E.164, local 07…, or any common format' }),
   body:      z.string().min(1).openapi({ description: 'Message text' }),
+  override:  OverrideField,
 });
 
 export const SendBulkBodySchema = z.object({
@@ -70,16 +78,8 @@ export const SendBulkBodySchema = z.object({
     recipient: z.string().min(1).openapi({ description: 'Phone number' }),
     body:      z.string().min(1).openapi({ description: 'Message text' }),
   })).min(1).max(500).openapi({ description: '1–500 message objects' }),
+  override:  OverrideField,
 });
-
-// ---------------------------------------------------------------------------
-// Quiet hours response (reused across send endpoints)
-// ---------------------------------------------------------------------------
-
-const quietHoursResponse = {
-  description: `Quiet hours — sends paused outside ${pad(QUIET_HOUR_START)}:00–${pad(QUIET_HOUR_END)}:00 (${QUIET_HOUR_TZ}). Body is the standard error envelope with code "QUIET_HOURS" and a retryAfter field (seconds).`,
-  content: { 'application/json': { schema: ErrorResponseSchema } },
-};
 
 const errorResponse = (description: string) => ({
   description,
@@ -205,6 +205,10 @@ const idempotencyKeyHeader = z.object({
     description: 'Optional opaque key (8–200 chars). Worker caches the response for 24 h and replays it on retry, so a timed-out request can be retried safely without double-sending. Cache is in-memory; key reuse with a different body returns 422.',
     example: 'fd-2026-05-16-school-9f3e-msg-42',
   }),
+  'X-Worker-Override': z.string().optional().openapi({
+    description: '**High ban risk.** Set to `1` (or any truthy string) to bypass every anti-ban gate: quiet hours, HTTP send rate-limit, per-recipient cooldown, per-account / warmup / global token buckets, inter-message jitter. Auth, liveness probe, idempotency, and body variation still apply. Equivalent to passing `{ "override": true }` in the request body. Every override-tagged send is logged at `warn` level and surfaces with an ⚠ OVERRIDE badge on the dashboard.',
+    example: '1',
+  }),
 });
 
 registry.registerPath({
@@ -224,7 +228,9 @@ registry.registerPath({
     429: sendRateLimitedResponse,
     500: errorResponse('Internal error'),
     502: errorResponse('Send failed — error.code is "SEND_FAILED"; error.details carries recipientPhone + timestamp'),
-    503: quietHoursResponse,
+    503: errorResponse(
+      'Send not currently possible. `error.code` is one of: `QUIET_HOURS` (outside the configured 07:00–21:00 EAT window — body carries `retryAfter` seconds), `SESSION_UNHEALTHY` (the underlying WhatsApp Web socket dropped; worker has kicked off a debounced reinit — caller should retry after `retryAfter` seconds).',
+    ),
   },
 });
 
@@ -243,7 +249,9 @@ registry.registerPath({
     409: errorResponse('Another request with this Idempotency-Key is still in flight'),
     422: errorResponse('Idempotency-Key reused with a different request body'),
     429: sendRateLimitedResponse,
-    503: quietHoursResponse,
+    503: errorResponse(
+      'Send not currently possible. `error.code` is one of: `QUIET_HOURS` (outside the configured 07:00–21:00 EAT window — body carries `retryAfter` seconds), `SESSION_UNHEALTHY` (the underlying WhatsApp Web socket dropped; worker has kicked off a debounced reinit — caller should retry after `retryAfter` seconds).',
+    ),
   },
 });
 

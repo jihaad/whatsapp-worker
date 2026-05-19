@@ -3,9 +3,11 @@ import pinoHttp from 'pino-http';
 import { logger } from './logger';
 import { restoreSessions, persistAndDestroyAll } from './sessions';
 import { authMiddleware } from './middleware/auth';
+import { requestTrace } from './middleware/request-trace';
 import { globalLimiter } from './lib/rate-limit';
 import { markInterruptedBatches, startBulkBatchEviction } from './lib/bulk-batch-maintenance';
 import { startEventPersistence } from './lib/event-persistence';
+import { startSessionWatchdog } from './lib/session-watchdog';
 import { registry } from './metrics';
 import healthRouter from './routes/health';
 import docsRouter from './routes/docs';
@@ -13,6 +15,7 @@ import sessionsRouter from './routes/sessions';
 import messagesRouter from './routes/messages';
 import eventsRouter from './routes/events';
 import dashboardRouter from './routes/dashboard';
+import faviconRouter from './routes/favicon';
 
 // whatsapp-web.js fires async `framenavigated` events without try/catch. When
 // WhatsApp Web navigates mid-inject, Puppeteer throws "Execution context was
@@ -56,7 +59,9 @@ app.use(pinoHttp({
       req.url === '/metrics' ||
       req.url === '/events' ||
       req.url === '/dashboard' ||
-      (req.url ?? '').startsWith('/dashboard/'),
+      (req.url ?? '').startsWith('/dashboard/') ||
+      req.url === '/favicon.ico' ||
+      req.url === '/favicon.svg',
   },
   customLogLevel: (_req, res, err) => {
     if (err || res.statusCode >= 500) return 'error';
@@ -85,12 +90,20 @@ app.use((_req, res, next) => {
   next();
 });
 app.use(express.json({ limit: '256kb' }));
+// Trace every authenticated-API request (method/path/status/latency/headers/
+// bodies) and publish to the eventBus. The dashboard's Network panel
+// subscribes to these for ops debugging. Runs after express.json so req.body
+// is parsed; runs before the rate limiter so 429s + 401s are also captured.
+app.use(requestTrace);
 // Global rate limit runs BEFORE auth so unauthenticated floods are throttled
 // at the door. Send-specific limiter is applied per-route in src/routes/messages.ts.
 app.use(globalLimiter);
 app.use(authMiddleware);
 
 // Infra endpoints stay unversioned — they're not part of the API contract.
+// favicon mounts at app root (handler matches /favicon.svg + /favicon.ico)
+// so the browser's auto-fetch from any page picks up the WhatsApp glyph.
+app.use(faviconRouter);
 app.use('/health', healthRouter);
 app.use('/docs', docsRouter);
 app.use('/dashboard', dashboardRouter);
@@ -120,6 +133,10 @@ app.listen(PORT, HOST, () => {
   // dashboard's feed survives worker restarts. 7-day retention; eviction
   // sweep runs hourly.
   startEventPersistence();
+  // Probe every `ready` session every 5 min and flip status to
+  // `disconnected` on a dead WhatsApp Web socket. Detect-only — never
+  // auto-reinits (that would risk a ban from re-link bursts).
+  startSessionWatchdog();
 });
 
 // Graceful shutdown — close Chromium cleanly and persist settled sessions so
