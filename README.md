@@ -56,7 +56,6 @@ Pure-API WhatsApp Web worker. Transport-only: exposes versioned HTTPS endpoints 
 │       ├── events.ts            # /events (SSE) + /events/recent (DB backfill)
 │       └── dashboard.ts         # /dashboard (operator HTML — see "Dashboard")
 ├── deploy/
-│   ├── whatsapp-worker.service  # systemd unit
 │   └── cloudflared.config.yml   # Cloudflare Tunnel ingress
 ├── .env.example
 ├── TODO.md
@@ -135,8 +134,9 @@ npm run dev                   # tsx watch — restarts on save
 
 Pending work is tracked in [`TODO.md`](TODO.md). The summary below is the
 operator's checklist for the production host — a Lenovo ThinkCentre M900
-Tiny (Intel i3/i5, 4 GB RAM, single-host, autostart via systemd, public
-ingress via Cloudflare Tunnel). Replace `wa-worker` (the chosen service /
+Tiny (Intel i3/i5, 4 GB RAM, single-host, worker supervised by pm2,
+public ingress via Cloudflare Tunnel, deploys via GitHub Actions over
+Tailscale). Replace `wa-worker` (the chosen service /
 user name in these examples) with whatever you prefer — it's just a
 convention.
 
@@ -218,14 +218,25 @@ sudo -u wa-worker -i nano .env       # fill in real values
 sudo chmod 600 /home/wa-worker/app/.env
 ```
 
-### 5. systemd service
+### 5. Process supervisor (pm2)
 
 ```bash
-sudo cp deploy/whatsapp-worker.service /etc/systemd/system/whatsapp-worker.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now whatsapp-worker
-sudo journalctl -u whatsapp-worker -f     # tail logs
+# Install pm2 globally as the worker user
+sudo -u wa-worker -i npm install -g pm2
+
+# Start the worker under pm2 and persist across reboots
+sudo -u wa-worker -i pm2 start npm --name whatsapp-worker -- start
+sudo -u wa-worker -i pm2 save
+sudo env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u wa-worker --hp /home/wa-worker
+
+# Tail logs
+sudo -u wa-worker -i pm2 logs whatsapp-worker
 ```
+
+The GitHub Actions deploy workflow (`.github/workflows/deploy.yml`) SSHes
+in over Tailscale and runs `deploy.sh`, which pulls the latest commit,
+installs deps, regenerates the Prisma client, and runs `pm2 restart
+whatsapp-worker`.
 
 ### 6. Cloudflare Tunnel
 
@@ -289,9 +300,9 @@ Symptoms: tunnel returns 502; `curl /health` times out; clients see
 
 ```bash
 ssh wa-worker@<host>
-sudo systemctl status whatsapp-worker
-sudo journalctl -u whatsapp-worker -n 200
-sudo systemctl restart whatsapp-worker
+pm2 status
+pm2 logs whatsapp-worker --lines 200 --nostream
+pm2 restart whatsapp-worker
 sleep 30 && curl https://<your-hostname>/health
 ```
 
@@ -312,8 +323,9 @@ If the linked phone number is genuinely banned (not just a dead socket), no rein
 
 ### Host rebooted / power loss
 
-Both `whatsapp-worker` and `cloudflared` autostart via systemd. Sessions
-auto-restore from `whatsapp_sessions` blobs (no fresh QR needed).
+pm2 (via its `pm2 startup` systemd hook) and `cloudflared` both autostart
+on boot. Sessions auto-restore from `whatsapp_sessions` blobs (no fresh
+QR needed).
 
 ### Token rotation (every 90 days)
 
@@ -325,7 +337,7 @@ openssl rand -hex 32   # new shared secret
 # - This repo's .env  → set new value, restart
 # - Client env vars   → swap to new value, redeploy
 
-sudo systemctl restart whatsapp-worker
+pm2 restart whatsapp-worker
 ```
 
 ---
