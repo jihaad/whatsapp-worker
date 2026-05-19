@@ -130,6 +130,60 @@ npm run dev                   # tsx watch — restarts on save
 
 ---
 
+## Network architecture
+
+Three independent layers, each with a distinct trust boundary:
+
+```
+   ┌──────────────────┐    ┌──────────────────┐    ┌────────────────┐
+   │  LAN clients     │    │  public HTTPS    │    │  ops / CI SSH  │
+   │  (apps on the    │    │  callers         │    │  (Mac, GitHub  │
+   │   same network)  │    │  & dashboard     │    │   Actions)     │
+   └────────┬─────────┘    └────────┬─────────┘    └────────┬───────┘
+            │                       │                       │
+            │ http://<lan-ip>       │ https://worker        │
+            │   :3001               │   .fududeey-          │ ssh
+            │                       │   waxbarasho.com      │
+            │                       ▼                       ▼
+            │                  ┌──────────┐         ┌──────────────┐
+            │                  │  CF      │         │  Tailscale   │
+            │                  │  Tunnel  │         │  mesh VPN    │
+            │                  │  (edge)  │         │              │
+            │                  └────┬─────┘         └──────┬───────┘
+            │                       │                      │
+            │                       │ outbound-init        │
+            │                       ▼                      │
+            │              ┌─────────────────┐             │
+            │              │  cloudflared    │             │
+            │              │  (host daemon)  │             │
+            │              └────────┬────────┘             │
+            │                       │                      │
+            │                       │ 127.0.0.1:3001       │
+            │                       ▼                      │
+            │              ┌─────────────────────────┐     │
+            └─────────────►│  worker (0.0.0.0:3001)  │     │
+                           │  on the TinyPC          │     │
+                           └─────────────────────────┘     │
+                                                           │
+                                  TinyPC sshd ◄────────────┘
+```
+
+The three layers and what each gates:
+
+| Layer | What it's for | Auth at this layer |
+|---|---|---|
+| **Direct LAN** (`http://<tinypc-lan-ip>:3001`) | Apps on the same network hitting the worker without going through Cloudflare. The worker binds to `0.0.0.0:3001` (set via `WHATSAPP_WORKER_HOST` in `.env`) so LAN clients can reach it. | `X-Worker-Secret` header on every `/v1/*` request. |
+| **Cloudflare Tunnel** (`https://worker.fududeey-waxbarasho.com`) | Public HTTPS for external callers (other cloud services, the dashboard from off-network). TLS terminates at Cloudflare's edge; `cloudflared` on TinyPC keeps an outbound connection open and forwards inbound requests to `127.0.0.1:3001`. No public port is open on the host. | `X-Worker-Secret` header (same as LAN). Optionally add Cloudflare Access in front for an extra auth layer. |
+| **Tailscale** (mesh VPN) | SSH-only — your Mac and the GitHub Actions deploy runner connect to TinyPC over Tailscale to push code and run `deploy.sh`. The worker API does **not** ride Tailscale. | SSH key auth. UFW blocks all SSH from the public internet, so the Tailscale interface is the only path in. |
+
+**Trust-boundary implications:**
+- Auth on the worker's HTTP surface is the shared secret — both LAN and Cloudflare paths gate on it.
+- Compromising the LAN doesn't grant SSH (that's Tailscale-only).
+- Compromising SSH doesn't bypass the worker's HTTP auth.
+- The worker secret leaking is the single biggest risk on this setup; rotate it on the schedule in the runbook below.
+
+---
+
 ## Production deploy (Lenovo ThinkCentre M900 Tiny · 4 GB · Ubuntu 22.04 LTS)
 
 Pending work is tracked in [`TODO.md`](TODO.md). The summary below is the
