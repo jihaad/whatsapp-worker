@@ -11,7 +11,7 @@ echo "Generating Prisma client..."
 npx prisma generate
 
 echo "Restarting app..."
-pm2 restart whatsapp-worker
+sudo -u worker pm2 restart whatsapp-worker
 
 echo "Done! App is running."
-pm2 status
+sudo -u worker pm2 status
