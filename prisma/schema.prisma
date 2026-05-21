@@ -28,7 +28,7 @@ datasource db {
 /// persisted as a column. Restart = new in-memory state, sessionData
 /// gives us the auth needed to reconnect without a fresh QR.
 model WhatsAppSession {
-  schoolId    String   @id @db.Uuid
+  sessionId   String   @id @db.Uuid
   sessionData Bytes
   phoneNumber String?
   linkedAt    DateTime @default(now())

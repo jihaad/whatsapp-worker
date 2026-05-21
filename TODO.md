@@ -4,7 +4,7 @@ What's left to ship on `whatsapp-worker`. Architecture, repo layout, and the dep
 
 **Current state:** pure-API, transport-only, on `/v1`. Sessions (paginated, live-updated over SSE), single + bulk messages (persisted, idempotent, upfront session-health-checked), liveness + readiness probes, Prometheus `/metrics`, OpenAPI at `/docs`, live operator dashboard at `/dashboard` with Messages / Network / Sessions tabs (SSE event stream + DB-backed history + in-tab session management). Standard error envelope across all non-2xx paths. Per-IP HTTP rate limit (600/min global, 30/min sends), `Cache-Control: no-store`, structured pino logging with request IDs. Anti-ban: 5–15s jitter, 07:00–21:00 EAT quiet hours, 5-min per-recipient cooldown, per-account token bucket (5 → 30 msg/min warmup), 100 msg/min global cap, typing indicator + read receipts, per-send trailing-whitespace body variation. Session-health: pre-send `getState()` liveness probe, debounced 15-min reinit cooldown (ban-safe), watchdog sweep every 5 min, `SESSION_UNHEALTHY` 503 envelope, init-failed-on-restore self-heal. Sessions persisted as tar.gz blobs in Postgres `whatsapp_sessions`; bulk batches in `whatsapp_bulk_batches`; per-message audit in `whatsapp_message_events`. pm2-managed (via systemd-hooked pm2 startup); public ingress via Cloudflare Tunnel (`deploy/cloudflared.config.yml`); CI deploys over Tailscale (`.github/workflows/deploy.yml`).
 
-**Not shipped yet:** HMAC auth, isolating the worker's Postgres into its own Supabase project, and renaming the `schoolId` column / variables to `sessionId` to match the project-agnostic stance. Below in priority order.
+**Not shipped yet:** HMAC auth. Below.
 
 ---
 
@@ -34,54 +34,7 @@ Today every request authenticates with the static `X-Worker-Secret` header (matc
 
 ---
 
-## 2. Separate Supabase project — isolate worker storage
-
-The worker currently shares a Supabase project with the consuming application. That's a layering violation: a compromised worker secret reaches the caller's tables, and the worker's Prisma schema has to omit those tables (which is why `prisma db push` would propose dropping every other table — we use `prisma db execute --file` as a workaround). Worse, the caller's `prisma db push` keeps re-adding the `whatsapp_sessions_schoolId_fkey` foreign key, which breaks fresh links until we drop it again ([prisma/sql/drop_session_fk.sql](prisma/sql/drop_session_fk.sql)). Give the worker its own Supabase project so the only thing in that DB is what `prisma/schema.prisma` declares.
-
-- [ ] Provision a new Supabase project — worker-only. Note `DIRECT_URL` (port 5432, session pooler) for the connection string.
-- [ ] Run `prisma/sql/*.sql` against the new project via `prisma db execute` to materialise the schema. (Once isolated, `prisma db push` becomes safe — but keep the SQL files as the canonical record.)
-- [ ] Migrate live data — small dataset, single transaction is fine:
-  - `pg_dump --data-only --table=whatsapp_sessions --table=whatsapp_bulk_batches --table=whatsapp_message_events <old DIRECT_URL>`
-  - `psql <new DIRECT_URL> < dump.sql`
-  - Verify row counts match on both sides before switching.
-- [ ] Update worker `.env`: `DIRECT_URL` (and optional `WORKER_DATABASE_URL`) point at the new project. Restart the worker; confirm session restore works and `/health/ready` reports `db: ok`.
-- [ ] Drop the worker's tables from the old shared project once the new one has been running cleanly for ~24 h. Document the cutover in the consuming application's runbook.
-- [ ] Once isolated, drop the "schema-sync" framing in `prisma/schema.prisma` — the worker now owns its DB outright and doesn't need to mention the consuming application's schema at all.
-
-**Why this matters:** blast-radius reduction (a leaked worker secret can't reach the caller's data), independent schema evolution, independent Postgres upgrades, simpler ops (`prisma db push` works), no more recurring FK violations, and clearer audit boundaries.
-
----
-
-## 3. Drop legacy `schoolId` — rename to `sessionId` everywhere
-
-The worker is project-agnostic — `schoolId` is a vestige of the original use case and contradicts the rest of the codebase, which already says "treat it as an opaque tenant UUID" in every comment. Rename it once so internal names match the external HTTP contract (`POST /v1/sessions/:sessionId` already uses `sessionId`).
-
-**Best done together with §2 (separate Supabase) so the column rename is a single coordinated migration.** Doing it before §2 requires updating the consuming application's mirror schema in lockstep, which is the same kind of cross-app drift §2 exists to eliminate.
-
-### DB
-
-- [ ] Write a SQL migration ([prisma/sql/rename_session_id.sql](prisma/sql/rename_session_id.sql)): `ALTER TABLE whatsapp_sessions RENAME COLUMN "schoolId" TO "sessionId";` plus any FK / index name updates. Apply via `prisma db execute`.
-- [ ] Update [prisma/schema.prisma](prisma/schema.prisma) — `WhatsAppSession.schoolId` → `sessionId`. Same change in any consuming-app mirror schema **until §2 ships**.
-
-### Worker code
-
-- [ ] [src/sessions.ts](src/sessions.ts) — `schoolId` → `sessionId` in every signature: `initSession`, `getSession`, `destroySession`, `sendMessage`, internal `ManagedSession` references, `sessions: Map<...>` key, `initializing: Set<...>`, log child contexts, event payloads (`session.*` events already publish `sessionId`, but internal helpers use `schoolId`).
-- [ ] [src/database-auth.ts](src/database-auth.ts) — `DatabaseAuth` constructor still takes `clientId`; internal `this.schoolId` field renames to `this.sessionId`. All Prisma calls go from `where: { schoolId }` to `where: { sessionId }`.
-- [ ] [src/lib/messaging-limits.ts](src/lib/messaging-limits.ts) — `forgetAccount(schoolId)` / `consumeRateTokens(schoolId)` → rename param. DB read `prisma.whatsAppSession.findUnique({ where: { schoolId } })` updates.
-- [ ] [src/lib/bulk-batch-maintenance.ts](src/lib/bulk-batch-maintenance.ts) — no `schoolId` directly but verify after the dust settles.
-- [ ] [src/sessions.ts:listSessions](src/sessions.ts) and `toSchoolSession` — the result type `SchoolSession` should also rename (e.g. to `WorkerSession`); the route already serialises `sessionId` so external callers are unaffected.
-- [ ] [src/routes/](src/routes/) — replace any `schoolId` locals with `sessionId`. HTTP path params (`:sessionId`) are already correct.
-
-### Verification
-
-- [ ] `grep -rn schoolId src/` returns zero hits.
-- [ ] `npx tsc --noEmit` clean.
-- [ ] Restart the worker, link a fresh session via the dashboard, send a test message, confirm the session row persists with the new column name.
-- [ ] If §2 hasn't shipped yet: run the same migration against the consuming application's DB and update its mirror schema in lockstep.
-
----
-
-## 4. Out of scope
+## 2. Out of scope
 
 Things that have come up and been explicitly ruled out — leave them ruled out unless the architecture changes:
 
@@ -94,7 +47,7 @@ Things that have come up and been explicitly ruled out — leave them ruled out 
 
 ---
 
-## 5. References
+## 3. References
 
 **Worker — runtime**
 - `src/index.ts` — express app wiring (pino-http, request-id, cache-control, request-trace, auth, rate-limit, routers, signal handlers).
@@ -106,7 +59,7 @@ Things that have come up and been explicitly ruled out — leave them ruled out 
 **Worker — `src/lib/`**
 - `errors.ts` — `sendError()` + `ErrorResponseSchema`. Every non-2xx response uses this envelope.
 - `idempotency.ts` — `Idempotency-Key` middleware (in-memory cache, 24h TTL, replay detection).
-- `rate-limit.ts` — per-IP HTTP rate limiter (swap key strategy to `req.tokenId` when §1 lands).
+- `rate-limit.ts` — per-IP HTTP rate limiter (swap key strategy to `req.tokenId` when §1 HMAC auth lands).
 - `messaging-limits.ts` — anti-ban suite (recipient cooldown, account/global token buckets, warmup curve).
 - `body-variation.ts` — per-send trailing-whitespace body variation (`WHATSAPP_BODY_VARIATION` to toggle).
 - `bulk-batch-maintenance.ts` — boot sweep (`processing` → `interrupted`) + 24h eviction of finished batches.

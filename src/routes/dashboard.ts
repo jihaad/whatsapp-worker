@@ -121,6 +121,51 @@ const HTML = /* html */ `<!DOCTYPE html>
     background: var(--bg-card); border: 1px solid var(--border-1);
   }
   .dot { width: 8px; height: 8px; border-radius: 999px; }
+
+  /* Header action chips — unified pill styling for reveal / clear / forget
+     secret. Visually matches the mode-tab seg-btn aesthetic. */
+  .action-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 6px 10px; border-radius: 8px; font-size: 12px;
+    color: #a3a3a3;
+    background: var(--bg-card); border: 1px solid var(--border-1);
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    cursor: pointer; white-space: nowrap;
+    /* mobile tappable target: 44px ish */
+    min-height: 32px;
+  }
+  .action-pill:hover { color: #ededed; background: var(--bg-elev); border-color: var(--border-2); }
+  .action-pill .action-icon {
+    font-size: 11px; line-height: 1;
+    width: 14px; text-align: center;
+    color: #737373;
+    transition: color 0.15s ease;
+  }
+  .action-pill:hover .action-icon { color: #d4d4d4; }
+  .action-pill[data-on="true"] {
+    color: #fbbf24;
+    background: rgba(245,158,11,0.08);
+    border-color: rgba(245,158,11,0.30);
+  }
+  .action-pill[data-on="true"] .action-icon { color: #fbbf24; }
+
+  /* On very narrow screens (< 640px), action chips collapse to icon-only.
+     Mode tabs stay legible because they sit on their own line. */
+  @media (max-width: 639px) {
+    .action-pill .action-label { display: none; }
+    .action-pill { padding: 6px 8px; }
+  }
+
+  /* Hide horizontal scrollbar on mode-tab container so swipe-scroll on
+     mobile doesn't leave a thick visible track. */
+  .scrollbar-none::-webkit-scrollbar { display: none; }
+  .scrollbar-none { scrollbar-width: none; }
+
+  /* Header right-side actions: push to a new line on mid-narrow screens
+     instead of squishing. ml-auto + flex-wrap on the header handles this. */
+  @media (max-width: 767px) {
+    .header-actions { margin-left: 0; width: 100%; justify-content: flex-end; }
+  }
 </style>
 </head>
 <body class="stage min-h-screen">
@@ -139,10 +184,11 @@ const HTML = /* html */ `<!DOCTYPE html>
 </div>
 
 <!-- ===== Header ===== -->
-<header class="relative z-10 px-6 py-4 flex items-center gap-4 hairline border-b">
-  <div class="flex items-center gap-3">
-    <div class="w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-semibold">W</div>
-    <h1 class="text-base font-semibold tracking-tight">WhatsApp Worker</h1>
+<header class="relative z-10 px-4 sm:px-6 py-3 hairline border-b flex flex-wrap items-center gap-x-3 gap-y-2">
+  <!-- Brand + state pills -->
+  <div class="flex items-center gap-2 sm:gap-3 min-w-0">
+    <div class="w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-semibold shrink-0">W</div>
+    <h1 class="text-sm sm:text-base font-semibold tracking-tight truncate">WhatsApp Worker</h1>
   </div>
 
   <div id="status" class="status-pill text-neutral-400">
@@ -155,20 +201,27 @@ const HTML = /* html */ `<!DOCTYPE html>
     <span id="worker-uptime" class="num text-neutral-200">—</span>
   </div>
 
-  <!-- View mode tabs -->
-  <div class="seg rounded-lg p-1 flex gap-1 ml-2">
-    <button data-mode="messages" class="mode-btn seg-btn is-active px-4 py-1.5 rounded-md text-xs font-medium">Messages</button>
-    <button data-mode="network"  class="mode-btn seg-btn px-4 py-1.5 rounded-md text-xs font-medium">Network <span class="count" id="cnt-net">0</span></button>
-    <button data-mode="sessions" class="mode-btn seg-btn px-4 py-1.5 rounded-md text-xs font-medium">Sessions <span class="count" id="cnt-sess">0</span></button>
+  <!-- View mode tabs — scroll horizontally on very narrow screens -->
+  <div class="seg rounded-lg p-1 flex gap-1 overflow-x-auto scrollbar-none">
+    <button data-mode="messages" class="mode-btn seg-btn is-active px-3 sm:px-4 py-1.5 rounded-md text-xs font-medium whitespace-nowrap">Messages</button>
+    <button data-mode="network"  class="mode-btn seg-btn px-3 sm:px-4 py-1.5 rounded-md text-xs font-medium whitespace-nowrap">Network <span class="count" id="cnt-net">0</span></button>
+    <button data-mode="sessions" class="mode-btn seg-btn px-3 sm:px-4 py-1.5 rounded-md text-xs font-medium whitespace-nowrap">Sessions <span class="count" id="cnt-sess">0</span></button>
   </div>
 
-  <div class="ml-auto flex items-center gap-4 text-sm text-neutral-400">
-    <label class="flex items-center gap-2 cursor-pointer select-none hover:text-neutral-200 transition-colors">
-      <input id="reveal" type="checkbox" class="accent-amber-500" />
-      <span>show numbers</span>
-    </label>
-    <button id="clear-feed" class="hover:text-neutral-200 transition-colors">Clear</button>
-    <button id="logout" class="hover:text-neutral-200 transition-colors">Forget secret</button>
+  <!-- Right-side actions — pill style matches mode-btn aesthetic, wraps below on mobile -->
+  <div class="header-actions flex items-center gap-1.5 ml-auto">
+    <button id="reveal-btn" class="action-pill" data-on="false" title="Toggle full phone-number display (off = last-4 masked)">
+      <span class="action-icon" aria-hidden="true">○</span>
+      <span class="action-label">Show numbers</span>
+    </button>
+    <button id="clear-feed" class="action-pill" title="Clear the current tab's local cache (server data is untouched)">
+      <span class="action-icon" aria-hidden="true">✕</span>
+      <span class="action-label">Clear</span>
+    </button>
+    <button id="logout" class="action-pill" title="Forget the stored worker secret on this device">
+      <span class="action-icon" aria-hidden="true">⎋</span>
+      <span class="action-label">Forget secret</span>
+    </button>
   </div>
 </header>
 
@@ -550,6 +603,19 @@ function renderMessageRow(ev) {
   if (isSent && d.messageId)   chips.push('<span class="meta-chip text-neutral-400 hover:text-neutral-200" data-copy="' + d.messageId + '" title="' + d.messageId + ' — click to copy">msg ' + shortId(d.messageId, 12) + '</span>');
   if (isFailed && d.reason)    chips.push('<span class="text-rose-300/80 text-[11px]">' + d.reason + '</span>');
 
+  // Resend chip — only renders when we have enough data (sessionId + recipient
+  // + body). Clicking triggers a fresh POST /v1/messages/send with
+  // X-Worker-Override: 1 set, bypassing all anti-ban gates. Payload is
+  // JSON-encoded into a data attribute so newlines / quotes in the body
+  // ride safely through HTML.
+  const canResend = (isSent || isFailed) && typeof d.sessionId === 'string'
+    && typeof d.recipient === 'string' && typeof d.body === 'string' && d.body.length > 0;
+  if (canResend) {
+    const payload = JSON.stringify({ sessionId: d.sessionId, recipient: d.recipient, body: d.body });
+    const escapedPayload = payload.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    chips.push('<button class="resend-chip" data-resend="' + escapedPayload + '" title="Resend with X-Worker-Override (bypasses every anti-ban gate)">↻ Resend</button>');
+  }
+
   // Message body — shown for sent/failed events for debugging. The body is
   // already gated by the worker secret (only auth'd dashboard subscribers
   // see it) so no further redaction.
@@ -586,7 +652,83 @@ function renderMessageRow(ev) {
     el.addEventListener('mouseleave', () => { el.style.background = 'rgba(255,255,255,0.04)'; });
     el.addEventListener('click', () => copyToClipboard(el.dataset.copy, el));
   }
+  // Resend chip — amber tint signals "bypasses anti-ban; use with intent".
+  for (const el of row.querySelectorAll('.resend-chip')) {
+    el.style.cursor = 'pointer';
+    el.style.background = 'rgba(245,158,11,0.10)';
+    el.style.border = '1px solid rgba(245,158,11,0.30)';
+    el.style.color = '#fbbf24';
+    el.style.padding = '2px 8px';
+    el.style.borderRadius = '999px';
+    el.style.fontWeight = '500';
+    el.style.transition = 'background 0.15s ease';
+    el.addEventListener('mouseenter', () => { if (!el.disabled) el.style.background = 'rgba(245,158,11,0.20)'; });
+    el.addEventListener('mouseleave', () => { if (!el.disabled) el.style.background = 'rgba(245,158,11,0.10)'; });
+    el.addEventListener('click', () => doResend(el));
+  }
   return row;
+}
+
+// Resend handler — re-POSTs to /v1/messages/send with X-Worker-Override.
+// Used by the ↻ Resend chip on message.sent / message.failed rows.
+async function doResend(btn) {
+  let payload;
+  try { payload = JSON.parse(btn.dataset.resend); }
+  catch { alert('Could not read resend payload'); return; }
+
+  const masked = maskPhone(payload.recipient);
+  if (!confirm(
+    'Resend to ' + masked + ' with OVERRIDE?\\n\\n' +
+    'This bypasses every anti-ban gate (quiet hours, rate limits, ' +
+    'recipient cooldown, jitter). High ban risk — use for diagnostics ' +
+    'or genuinely urgent sends only.'
+  )) return;
+
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '↻ Sending…';
+  btn.style.opacity = '0.6';
+
+  try {
+    const r = await fetch('/v1/messages/send', {
+      method: 'POST',
+      headers: {
+        'X-Worker-Secret': secret,
+        'X-Worker-Override': '1',
+        'X-Dashboard-Internal': '1',
+        'Content-Type': 'application/json',
+        // Random idempotency key so each click is a genuine new send (the
+        // whole point of resend is to fire again, not replay a cached one).
+        'Idempotency-Key': 'dashboard-resend-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) {
+      let errText = 'HTTP ' + r.status;
+      try {
+        const body = await r.json();
+        if (body?.error?.message) errText = body.error.code + ': ' + body.error.message;
+      } catch { /* non-json response */ }
+      alert('Resend failed — ' + errText);
+      btn.disabled = false;
+      btn.style.opacity = '';
+      btn.textContent = originalText;
+      return;
+    }
+    // Success — leave the button in a "done" state so user sees confirmation.
+    // The new send will also appear as a fresh ⚠ OVERRIDE row at the top of
+    // the feed (via the SSE stream / event bus).
+    btn.textContent = '✓ Resent';
+    btn.style.background = 'rgba(16,185,129,0.18)';
+    btn.style.borderColor = 'rgba(16,185,129,0.40)';
+    btn.style.color = '#34d399';
+    btn.style.opacity = '';
+  } catch (err) {
+    alert('Resend failed: ' + (err instanceof Error ? err.message : String(err)));
+    btn.disabled = false;
+    btn.style.opacity = '';
+    btn.textContent = originalText;
+  }
 }
 
 // Track which events are already rendered so live SSE events + ring-buffer
@@ -1009,8 +1151,12 @@ $('logout').addEventListener('click', () => {
 
 // ---------- UI controls ----------
 
-$('reveal').addEventListener('change', (e) => {
-  reveal = e.target.checked;
+$('reveal-btn').addEventListener('click', () => {
+  reveal = !reveal;
+  const btn = $('reveal-btn');
+  btn.setAttribute('data-on', String(reveal));
+  const icon = btn.querySelector('.action-icon');
+  if (icon) icon.textContent = reveal ? '●' : '○';
   rerenderFeed();
   renderSessions();
   renderSessionsTab();

@@ -184,21 +184,22 @@ The three layers and what each gates:
 
 ---
 
-## Production deploy (Lenovo ThinkCentre M900 Tiny · 4 GB · Ubuntu 22.04 LTS)
+## Production deploy (Lenovo ThinkCentre M900 Tiny · 12 GB · Ubuntu 22.04 LTS)
 
 Pending work is tracked in [`TODO.md`](TODO.md). The summary below is the
 operator's checklist for the production host — a Lenovo ThinkCentre M900
-Tiny (Intel i3/i5, 4 GB RAM, single-host, worker supervised by pm2,
+Tiny (Intel i3/i5, 12 GB RAM, single-host, worker supervised by pm2,
 public ingress via Cloudflare Tunnel, deploys via GitHub Actions over
 Tailscale). Replace `wa-worker` (the chosen service /
 user name in these examples) with whatever you prefer — it's just a
 convention.
 
-**Sizing on 4 GB:** plan for ~5 linked WhatsApp sessions comfortably, 7–8
-max. Each Chromium-backed session uses 300–500 MB steady-state; the OS +
-worker process take another ~500–700 MB. Add 2 GB of swap as a safety net
-(see step 1) and bump the file-descriptor limit (each Chromium burns
-through them).
+**Sizing on 12 GB:** plan for ~20 linked WhatsApp sessions comfortably,
+with headroom beyond that. Each Chromium-backed session uses 300–500 MB
+steady-state; the OS + worker process take another ~500–700 MB. The
+practical ceiling on this box is CPU and file descriptors before it's
+RAM — bump the FD limit (each Chromium burns through them) and keep an
+eye on load average as you add sessions.
 
 ### 1. Base OS hardening
 

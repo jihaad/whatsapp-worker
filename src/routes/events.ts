@@ -39,10 +39,15 @@ router.get('/', (req, res) => {
   // Send a connection-established event so the client knows it's wired up.
   res.write(`data: ${JSON.stringify({ type: 'connected', ts: new Date().toISOString(), data: {} })}\n\n`);
 
-  // Backfill from the ring buffer so reconnects (e.g. after a tsx-watch
-  // restart) don't show a blank feed. Marked `replay: true` so the dashboard
-  // can render them distinctly if it wants to.
+  // Backfill from both ring buffers so reconnects (e.g. after a tsx-watch
+  // restart) and fresh dashboard tabs don't show a blank feed. Marked
+  // `replay: true` so the dashboard can render them distinctly if it wants
+  // to. Messages first (low-volume, important context) then http traces
+  // (high-volume, populates the Network panel with recent activity).
   for (const event of eventBus.snapshot()) {
+    res.write(`data: ${JSON.stringify({ ...event, replay: true })}\n\n`);
+  }
+  for (const event of eventBus.snapshotHttp()) {
     res.write(`data: ${JSON.stringify({ ...event, replay: true })}\n\n`);
   }
 

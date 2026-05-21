@@ -85,12 +85,12 @@ async function rmrf(path: string, attempts = 5): Promise<void> {
  * track their own linked-status flags by polling the worker's HTTP API.
  */
 export class DatabaseAuth extends LocalAuth {
-  private readonly schoolId: string;
+  private readonly sessionId: string;
   private readonly resolvedDataPath: string;
 
   constructor(opts: { clientId: string; dataPath?: string }) {
     super(opts);
-    this.schoolId = opts.clientId;
+    this.sessionId = opts.clientId;
     this.resolvedDataPath = resolve(opts.dataPath ?? './.wwebjs_auth/');
 
     const parentBeforeBrowserInitialized = this.beforeBrowserInitialized.bind(this);
@@ -119,28 +119,28 @@ export class DatabaseAuth extends LocalAuth {
   }
 
   private async restoreFromDatabase(): Promise<void> {
-    const sessionDirName = `session-${this.schoolId}`;
+    const sessionDirName = `session-${this.sessionId}`;
     const sessionDir = join(this.resolvedDataPath, sessionDirName);
 
     try {
       const saved = await prisma.whatsAppSession.findUnique({
-        where: { schoolId: this.schoolId },
+        where: { sessionId: this.sessionId },
         select: { sessionData: true },
       });
       if (!saved?.sessionData) {
-        log.debug({ schoolId: this.schoolId }, 'no saved session blob — fresh link flow');
+        log.debug({ sessionId: this.sessionId }, 'no saved session blob — fresh link flow');
         return;
       }
 
       mkdirSync(this.resolvedDataPath, { recursive: true });
       await rmrf(sessionDir);
 
-      const tmpTar = join(this.resolvedDataPath, `${this.schoolId}.restore.tar.gz`);
+      const tmpTar = join(this.resolvedDataPath, `${this.sessionId}.restore.tar.gz`);
       await writeFile(tmpTar, Buffer.from(saved.sessionData));
       try {
         await extract({ file: tmpTar, cwd: this.resolvedDataPath });
         log.info(
-          { schoolId: this.schoolId, bytes: Buffer.from(saved.sessionData).length, sessionDir },
+          { sessionId: this.sessionId, bytes: Buffer.from(saved.sessionData).length, sessionDir },
           'restored session blob',
         );
       } finally {
@@ -152,18 +152,18 @@ export class DatabaseAuth extends LocalAuth {
         await rm(join(sessionDir, lock), { force: true });
       }
     } catch (err) {
-      log.error({ err, schoolId: this.schoolId }, 'restore failed');
+      log.error({ err, sessionId: this.sessionId }, 'restore failed');
     }
   }
 
   async persistToDatabase(phoneNumber?: string): Promise<void> {
-    const sessionDirName = `session-${this.schoolId}`;
+    const sessionDirName = `session-${this.sessionId}`;
     const sessionDir = join(this.resolvedDataPath, sessionDirName);
     if (!existsSync(sessionDir)) return;
 
-    const snapshotRoot = join(this.resolvedDataPath, `.snapshot-${this.schoolId}`);
+    const snapshotRoot = join(this.resolvedDataPath, `.snapshot-${this.sessionId}`);
     const snapshotSession = join(snapshotRoot, sessionDirName);
-    const tmpTar = join(this.resolvedDataPath, `${this.schoolId}.save.tar.gz`);
+    const tmpTar = join(this.resolvedDataPath, `${this.sessionId}.save.tar.gz`);
 
     try {
       await rmrf(snapshotRoot);
@@ -181,7 +181,7 @@ export class DatabaseAuth extends LocalAuth {
       );
       const blob = await readFile(tmpTar);
       log.info(
-        { schoolId: this.schoolId, sizeMb: Number((blob.byteLength / 1024 / 1024).toFixed(1)) },
+        { sessionId: this.sessionId, sizeMb: Number((blob.byteLength / 1024 / 1024).toFixed(1)) },
         'persisting session',
       );
 
@@ -189,11 +189,11 @@ export class DatabaseAuth extends LocalAuth {
       // "linked phone" or "last seen" columns are the caller's responsibility
       // — they poll the worker's HTTP API and update their own state.
       await prisma.whatsAppSession.upsert({
-        where: { schoolId: this.schoolId },
-        create: { schoolId: this.schoolId, sessionData: blob, phoneNumber: phoneNumber ?? null },
+        where: { sessionId: this.sessionId },
+        create: { sessionId: this.sessionId, sessionData: blob, phoneNumber: phoneNumber ?? null },
         update: { sessionData: blob, ...(phoneNumber ? { phoneNumber } : {}) },
       });
-      log.info({ schoolId: this.schoolId }, 'session persisted');
+      log.info({ sessionId: this.sessionId }, 'session persisted');
     } finally {
       await rm(tmpTar, { force: true });
       await rmrf(snapshotRoot);
@@ -202,7 +202,7 @@ export class DatabaseAuth extends LocalAuth {
 
   async clearFromDatabase(): Promise<void> {
     try {
-      await prisma.whatsAppSession.delete({ where: { schoolId: this.schoolId } });
+      await prisma.whatsAppSession.delete({ where: { sessionId: this.sessionId } });
     } catch { /* row may not exist */ }
   }
 }

@@ -37,31 +37,46 @@ export interface WorkerEvent {
   data: Record<string, unknown>;
 }
 
-// Ring buffer of recent events. Served as backfill to every new SSE
-// subscriber so reconnects (and fresh tabs) don't show a blank feed.
-// Specifically defends against the common "tsx-watch restart" gap: the
-// dashboard's SSE socket closes, reconnects ~1.5s later, and any events
-// published during that window would otherwise be lost.
-const RECENT_BUFFER_SIZE = 100;
+// Two parallel ring buffers — one for session / message / bulk events, one
+// for http.request traces. Both replayed on every new SSE subscriber so
+// reconnects (and fresh dashboard tabs) don't start blank.
+//
+// Why two buffers instead of one combined: http.request fires on every API
+// call — at 30 sends/min plus dashboard polling, a shared 100-slot ring
+// would fill with http traces in seconds and push out the messaging
+// signal that's actually load-bearing for ops debugging. Splitting keeps
+// each category's history independent.
+//
+// Sizes: 100 messages (low frequency, want history); 200 http traces
+// (higher volume; lifetime is just the dashboard's working memory anyway).
+// Both live for the process lifetime only — restart wipes them.
+const RECENT_MESSAGE_BUFFER_SIZE = 100;
+const RECENT_HTTP_BUFFER_SIZE = 200;
 
 class WorkerEventBus extends EventEmitter {
-  private recent: WorkerEvent[] = [];
+  private recentMessages: WorkerEvent[] = [];
+  private recentHttp: WorkerEvent[] = [];
 
   publish(type: WorkerEventType, data: Record<string, unknown> = {}): void {
     const event: WorkerEvent = { type, ts: new Date().toISOString(), data };
-    // HTTP traces are high-volume and don't need cross-reconnect replay —
-    // the dashboard's Network panel only cares about live events. Keep
-    // them out of the ring so message-event backfill isn't starved.
-    if (type !== 'http.request') {
-      this.recent.push(event);
-      if (this.recent.length > RECENT_BUFFER_SIZE) this.recent.shift();
+    if (type === 'http.request') {
+      this.recentHttp.push(event);
+      if (this.recentHttp.length > RECENT_HTTP_BUFFER_SIZE) this.recentHttp.shift();
+    } else {
+      this.recentMessages.push(event);
+      if (this.recentMessages.length > RECENT_MESSAGE_BUFFER_SIZE) this.recentMessages.shift();
     }
     this.emit('event', event);
   }
 
-  /** Snapshot of the most recent events (oldest first). Used for backfill. */
+  /** Recent session / message / bulk events (oldest first). */
   snapshot(): readonly WorkerEvent[] {
-    return this.recent;
+    return this.recentMessages;
+  }
+
+  /** Recent http.request traces (oldest first) — for Network panel backfill. */
+  snapshotHttp(): readonly WorkerEvent[] {
+    return this.recentHttp;
   }
 }
 

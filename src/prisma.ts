@@ -7,21 +7,18 @@ try { process.loadEnvFile('.env.local'); } catch { /* optional override */ }
 
 // The worker is a long-lived process with periodic loops + on-demand send
 // HTTP handlers. If you're on Supabase, connect via the **session pooler**
-// (DIRECT_URL, port 5432) rather than the transaction pooler — the latter
-// is sized for short-lived serverless functions and the worker would
-// quickly exhaust the connection_limit budget.
+// (port 5432) rather than the transaction pooler — the latter is sized for
+// short-lived serverless functions and the worker would quickly exhaust
+// the connection_limit budget.
 //
 // **Isolation note:** the worker can safely share a database with other
 // applications. The Prisma schema scope is the boundary — only worker-owned
 // tables are declared (`whatsapp_sessions`, `whatsapp_bulk_batches`,
 // `whatsapp_message_events`), so the generated client cannot query other
 // applications' tables even if they live in the same Postgres.
-//
-// Optional: a dedicated `WORKER_DATABASE_URL` env var lets you override
-// (e.g. point at a separate Postgres later). Falls back to DIRECT_URL.
-const workerConnString = process.env.WORKER_DATABASE_URL ?? process.env.DIRECT_URL;
+const workerConnString = process.env.DIRECT_URL;
 if (!workerConnString) {
-  throw new Error('[worker] DIRECT_URL (session pooler) is not set — required for the worker. Set DIRECT_URL or WORKER_DATABASE_URL in .env.');
+  throw new Error('[worker] DIRECT_URL is not set — required for the worker. Set DIRECT_URL in .env (session pooler URL on Supabase, port 5432).');
 }
 
 // tsx watch restarts the process on file change, but during a brief

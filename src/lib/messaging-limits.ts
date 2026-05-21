@@ -126,7 +126,7 @@ async function getAccountCapacity(sessionId: string): Promise<{ capacity: number
   let linkedAt = linkedAtCache.get(sessionId);
   if (linkedAt === undefined) {
     const row = await prisma.whatsAppSession.findUnique({
-      where: { schoolId: sessionId },
+      where: { sessionId: sessionId },
       select: { linkedAt: true },
     });
     linkedAt = row?.linkedAt ?? null;

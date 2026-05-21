@@ -22,7 +22,7 @@ const prettyTransport = !isProd && process.env.LOG_JSON !== '1'
         singleLine: true,
         // Lift correlation IDs and the worker's frequent context fields
         // onto the prefix line so they're visible at a glance.
-        messageFormat: '{if reqId}[{reqId}] {end}{if schoolId}[s:{schoolId}] {end}{if batchId}[b:{batchId}] {end}{msg}',
+        messageFormat: '{if reqId}[{reqId}] {end}{if sessionId}[s:{sessionId}] {end}{if batchId}[b:{batchId}] {end}{msg}',
       },
     }
   : undefined;

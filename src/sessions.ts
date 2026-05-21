@@ -11,7 +11,7 @@ import { varyBody } from './lib/body-variation';
  * Long-lived session manager for the WhatsApp worker process.
  *
  * The worker is the **transport layer** — it knows about WhatsApp Web
- * sessions keyed by an opaque UUID (`schoolId` in code for historical
+ * sessions keyed by an opaque UUID (`sessionId` in code for historical
  * reasons; treat it as an arbitrary tenant identifier). No knowledge of
  * the calling application's domain models. Callers track linked status
  * for their own UI by polling the worker's HTTP API.
@@ -23,7 +23,7 @@ import { varyBody } from './lib/body-variation';
 
 export type SessionStatus = 'disconnected' | 'connecting' | 'qr_pending' | 'ready';
 
-export interface SchoolSession {
+export interface WorkerSession {
   sessionId: string;
   status: SessionStatus;
   qrDataUrl: string | null;
@@ -79,7 +79,7 @@ interface ManagedSession {
 const sessions = new Map<string, ManagedSession>();
 
 /**
- * schoolIds whose initSession() is currently in-flight (Chromium launching).
+ * sessionIds whose initSession() is currently in-flight (Chromium launching).
  * getSession() returns `connecting` for these so clients keep polling.
  */
 const initializing = new Set<string>();
@@ -94,7 +94,7 @@ function getSessionDir(): string {
  * is a single long-lived process, a lock file always means a stale crash —
  * just delete it and retry.
  */
-async function tryInitialize(client: Client, schoolId: string): Promise<void> {
+async function tryInitialize(client: Client, sessionId: string): Promise<void> {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       await client.initialize();
@@ -115,7 +115,7 @@ async function tryInitialize(client: Client, schoolId: string): Promise<void> {
         // Crash-restart case: old Chromium is dead, lock files are stale.
         const { rm } = await import('node:fs/promises');
         const { join } = await import('node:path');
-        const sessionDir = join(getSessionDir(), `session-${schoolId}`);
+        const sessionDir = join(getSessionDir(), `session-${sessionId}`);
         await rm(join(sessionDir, 'SingletonLock'), { force: true }).catch(() => {});
         await rm(join(sessionDir, 'DevToolsActivePort'), { force: true }).catch(() => {});
         await new Promise((r) => setTimeout(r, 500));
@@ -134,8 +134,8 @@ async function tryInitialize(client: Client, schoolId: string): Promise<void> {
  * phone). In that case we drop the dead DB row so the next restart doesn't
  * keep retrying the bad blob.
  */
-export async function initSession(schoolId: string, isRestore = false): Promise<SchoolSession> {
-  const existing = sessions.get(schoolId);
+export async function initSession(sessionId: string, isRestore = false): Promise<WorkerSession> {
+  const existing = sessions.get(sessionId);
   if (existing) {
     // If the caller is asking for a session that's currently disconnected,
     // treat the POST as "please reconnect this dead session". Trigger a
@@ -145,18 +145,18 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
     // caller polls GET /v1/sessions/:id and sees status flip to
     // `connecting` → `ready` (or `qr_pending` if the blob is rejected).
     if (existing.status === 'disconnected') {
-      logger.child({ schoolId }).info('initSession on disconnected session — kicking forced reinit');
-      reinitializeSessionDebounced(schoolId, { force: true });
+      logger.child({ sessionId }).info('initSession on disconnected session — kicking forced reinit');
+      reinitializeSessionDebounced(sessionId, { force: true });
     }
-    return toSchoolSession(schoolId, existing);
+    return toWorkerSession(sessionId, existing);
   }
 
   eventBus.publish('session.init', {
-    sessionId: schoolId, isRestore,
+    sessionId: sessionId, isRestore,
     status: 'connecting', phoneNumber: null, qrDataUrl: null, lastActivity: new Date().toISOString(),
   });
-  const log = logger.child({ schoolId });
-  const auth = new DatabaseAuth({ clientId: schoolId, dataPath: getSessionDir() });
+  const log = logger.child({ sessionId });
+  const auth = new DatabaseAuth({ clientId: sessionId, dataPath: getSessionDir() });
   const initStart = Date.now();
   const client = new Client({
     authStrategy: auth,
@@ -197,7 +197,7 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
     lastActivity: new Date().toISOString(),
     readySince: null,
   };
-  sessions.set(schoolId, managed);
+  sessions.set(sessionId, managed);
 
   // Fires once per initSession lifecycle — used to detect a failed restore
   // (QR event after we extracted a saved blob = blob is dead).
@@ -210,14 +210,14 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
       managed.lastActivity = new Date().toISOString();
       log.info({ elapsedMs: Date.now() - initStart }, 'qr ready');
       eventBus.publish('session.qr', {
-        sessionId: schoolId, elapsedMs: Date.now() - initStart,
+        sessionId: sessionId, elapsedMs: Date.now() - initStart,
         status: 'qr_pending', qrDataUrl: managed.qrDataUrl, phoneNumber: managed.phoneNumber, lastActivity: managed.lastActivity,
       });
 
       if (isRestore && !qrSeen) {
         qrSeen = true;
         log.warn('restore rejected by WhatsApp — dropping stale blob');
-        await prisma.whatsAppSession.delete({ where: { schoolId } }).catch(() => {});
+        await prisma.whatsAppSession.delete({ where: { sessionId } }).catch(() => {});
       }
     } catch {
       managed.qrDataUrl = null;
@@ -233,7 +233,7 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
     if (info?.wid?.user) managed.phoneNumber = info.wid.user;
     log.info({ phoneNumber: managed.phoneNumber }, 'session ready');
     eventBus.publish('session.ready', {
-      sessionId: schoolId, phoneNumber: managed.phoneNumber,
+      sessionId: sessionId, phoneNumber: managed.phoneNumber,
       status: 'ready', qrDataUrl: null, lastActivity: managed.lastActivity,
       readySince: managed.readySince,
     });
@@ -269,7 +269,7 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
   client.on('authenticated', () => {
     log.info('authenticated');
     eventBus.publish('session.authenticated', {
-      sessionId: schoolId,
+      sessionId: sessionId,
       status: 'connecting', phoneNumber: managed.phoneNumber, qrDataUrl: null, lastActivity: managed.lastActivity,
     });
     managed.status = 'connecting';
@@ -283,14 +283,14 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
   client.on('disconnected', (reason) => {
     log.info({ reason }, 'session disconnected');
     eventBus.publish('session.disconnected', {
-      sessionId: schoolId, reason: String(reason),
+      sessionId: sessionId, reason: String(reason),
       status: 'disconnected', phoneNumber: managed.phoneNumber, qrDataUrl: null, lastActivity: managed.lastActivity,
     });
     managed.status = 'disconnected';
     managed.qrDataUrl = null;
     managed.readySince = null;
     managed.lastActivity = new Date().toISOString();
-    // Deliberately NOT calling sessions.delete(schoolId) here. The watchdog
+    // Deliberately NOT calling sessions.delete(sessionId) here. The watchdog
     // sweeps disconnected entries and attempts reinit (debounced — 15 min
     // cooldown applies), so a brief network blip self-heals: first sweep
     // after connectivity returns triggers reinit, and tryInitialize will
@@ -314,13 +314,13 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
   client.on('auth_failure', (msg) => {
     log.error({ msg }, 'auth failure');
     eventBus.publish('session.auth_failure', {
-      sessionId: schoolId, reason: String(msg),
+      sessionId: sessionId, reason: String(msg),
       status: 'disconnected', phoneNumber: managed.phoneNumber, qrDataUrl: null, lastActivity: managed.lastActivity,
     });
     managed.status = 'disconnected';
     managed.qrDataUrl = null;
     managed.readySince = null;
-    sessions.delete(schoolId);
+    sessions.delete(sessionId);
   });
 
   // Kick Chromium off in the background. Awaiting client.initialize() here
@@ -328,9 +328,9 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
   // chance to appear — the UI already polls getSession() every 2s, so we
   // just return the `connecting` session immediately and let the poll pick
   // up the QR the moment it's emitted.
-  tryInitialize(client, schoolId).catch((err) => {
+  tryInitialize(client, sessionId).catch((err) => {
     log.error({ err }, 'init failed');
-    sessions.delete(schoolId);
+    sessions.delete(sessionId);
     client.destroy().catch(() => {});
     // Deliberately do NOT drop the DB row on a restore-path init failure.
     // Earlier attempts at that self-heal were too aggressive: any transient
@@ -343,7 +343,7 @@ export async function initSession(schoolId: string, isRestore = false): Promise<
     // can trust. Anything else here is "try again next restart".
   });
 
-  return toSchoolSession(schoolId, managed);
+  return toWorkerSession(sessionId, managed);
 }
 
 /**
@@ -371,9 +371,9 @@ export async function restoreSessions(): Promise<void> {
     attempt++;
     try {
       const saved = await prisma.whatsAppSession.findMany({
-        select: { schoolId: true },
+        select: { sessionId: true },
       });
-      for (const row of saved) ids.add(row.schoolId);
+      for (const row of saved) ids.add(row.sessionId);
 
       // Also pick up any local session folders left by a previous run.
       // Without cross-table knowledge of the caller's tenant list, we trust
@@ -417,22 +417,22 @@ export async function restoreSessions(): Promise<void> {
   // disk + CPU calm; the first session is up before the next starts loading.
   const RESTORE_STAGGER_MS = 3_000;
   let i = 0;
-  for (const schoolId of ids) {
-    if (sessions.has(schoolId) || initializing.has(schoolId)) continue;
+  for (const sessionId of ids) {
+    if (sessions.has(sessionId) || initializing.has(sessionId)) continue;
 
     const delay = i * RESTORE_STAGGER_MS;
     i++;
-    initializing.add(schoolId);
+    initializing.add(sessionId);
     setTimeout(() => {
       // Re-check the maps after the delay — operator may have linked or
       // deleted this session via the API while we were waiting.
-      if (sessions.has(schoolId)) { initializing.delete(schoolId); return; }
-      initSession(schoolId, /* isRestore */ true)
+      if (sessions.has(sessionId)) { initializing.delete(sessionId); return; }
+      initSession(sessionId, /* isRestore */ true)
         .catch((err) => {
-          logger.error({ err, schoolId }, 'failed to restore session');
-          sessions.delete(schoolId);
+          logger.error({ err, sessionId }, 'failed to restore session');
+          sessions.delete(sessionId);
         })
-        .finally(() => initializing.delete(schoolId));
+        .finally(() => initializing.delete(sessionId));
     }, delay).unref();
   }
 }
@@ -457,8 +457,8 @@ export async function persistAndDestroyAll(timeoutMs = 30_000): Promise<void> {
 
   // Sequential: concurrent tars would thrash disk and each one is already
   // heavy (copy + gzip of ~30-80 MB).
-  for (const [schoolId, managed] of entries) {
-    const log = logger.child({ schoolId });
+  for (const [sessionId, managed] of entries) {
+    const log = logger.child({ sessionId });
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
       log.warn('shutdown: out of time, skipping');
@@ -483,13 +483,13 @@ export async function persistAndDestroyAll(timeoutMs = 30_000): Promise<void> {
     } catch (err) {
       log.error({ err }, 'shutdown: persist failed');
     } finally {
-      sessions.delete(schoolId);
+      sessions.delete(sessionId);
     }
   }
 }
 
-export async function getSession(schoolId: string): Promise<SchoolSession | null> {
-  const managed = sessions.get(schoolId);
+export async function getSession(sessionId: string): Promise<WorkerSession | null> {
+  const managed = sessions.get(sessionId);
   if (managed) {
     // Silent-disconnect detection on the polling endpoint. checkLive() has
     // a 5s cache so back-to-back polls don't add a getState round-trip
@@ -498,19 +498,19 @@ export async function getSession(schoolId: string): Promise<SchoolSession | null
     // reality, not a stale "ready". **Detect-only**: never triggers reinit
     // (that happens only on the send path).
     if (managed.status === 'ready') {
-      await checkLive(schoolId).catch(() => {});
+      await checkLive(sessionId).catch(() => {});
     }
-    return toSchoolSession(schoolId, managed);
+    return toWorkerSession(sessionId, managed);
   }
 
   // Restore in-flight — tell the caller to keep polling
-  if (initializing.has(schoolId)) {
-    return { sessionId: schoolId, status: 'connecting', qrDataUrl: null, phoneNumber: null, lastActivity: '', readySince: null };
+  if (initializing.has(sessionId)) {
+    return { sessionId: sessionId, status: 'connecting', qrDataUrl: null, phoneNumber: null, lastActivity: '', readySince: null };
   }
 
-  const hasSaved = await prisma.whatsAppSession.findUnique({ where: { schoolId }, select: { schoolId: true } });
+  const hasSaved = await prisma.whatsAppSession.findUnique({ where: { sessionId }, select: { sessionId: true } });
   if (hasSaved) {
-    return { sessionId: schoolId, status: 'disconnected', qrDataUrl: null, phoneNumber: null, lastActivity: '', readySince: null };
+    return { sessionId: sessionId, status: 'disconnected', qrDataUrl: null, phoneNumber: null, lastActivity: '', readySince: null };
   }
   return null;
 }
@@ -534,7 +534,7 @@ export function decodeCursor(s: string): PageCursor | null {
 }
 
 export interface ListSessionsResult {
-  sessions: SchoolSession[];
+  sessions: WorkerSession[];
   nextCursor: string | null;
 }
 
@@ -545,17 +545,17 @@ export interface ListSessionsResult {
  * sorted by sessionId ascending so pagination is stable.
  */
 export async function listSessions(opts: { limit: number; cursor?: string } = { limit: 50 }): Promise<ListSessionsResult> {
-  const live = Array.from(sessions.entries()).map(([id, m]) => toSchoolSession(id, m));
+  const live = Array.from(sessions.entries()).map(([id, m]) => toWorkerSession(id, m));
   const liveIds = new Set(live.map((s) => s.sessionId));
 
   const saved = await prisma.whatsAppSession.findMany({
-    select: { schoolId: true, phoneNumber: true, updatedAt: true },
+    select: { sessionId: true, phoneNumber: true, updatedAt: true },
   });
 
-  const offline: SchoolSession[] = saved
-    .filter((row) => !liveIds.has(row.schoolId))
+  const offline: WorkerSession[] = saved
+    .filter((row) => !liveIds.has(row.sessionId))
     .map((row) => ({
-      sessionId: row.schoolId,
+      sessionId: row.sessionId,
       status: 'disconnected' as const,
       qrDataUrl: null,
       readySince: null,
@@ -606,8 +606,8 @@ const STATE_CHECK_TIMEOUT_MS = 1500;
 const STATE_CHECK_CACHE_MS = 5_000;
 const REINIT_COOLDOWN_MS = 15 * 60 * 1000;
 
-export async function checkLive(schoolId: string, opts: { force?: boolean } = {}): Promise<'connected' | 'disconnected' | 'unknown'> {
-  const managed = sessions.get(schoolId);
+export async function checkLive(sessionId: string, opts: { force?: boolean } = {}): Promise<'connected' | 'disconnected' | 'unknown'> {
+  const managed = sessions.get(sessionId);
   if (!managed) return 'unknown';
 
   // Skip the round-trip if we just checked. Doesn't help correctness — it
@@ -634,13 +634,13 @@ export async function checkLive(schoolId: string, opts: { force?: boolean } = {}
   // PAIRING, null on Puppeteer-detached page) is non-live. Flip status if
   // we're transitioning out of `ready` so consumers see reality.
   if (managed.status === 'ready') {
-    const log = logger.child({ schoolId });
+    const log = logger.child({ sessionId });
     log.warn({ state }, 'session liveness check failed — marking disconnected');
     managed.status = 'disconnected';
     managed.qrDataUrl = null;
     managed.readySince = null;
     eventBus.publish('session.disconnected', {
-      sessionId: schoolId,
+      sessionId: sessionId,
       reason: 'liveness_check_failed:' + String(state ?? 'TIMEOUT'),
       status: 'disconnected',
       phoneNumber: managed.phoneNumber,
@@ -698,9 +698,9 @@ export async function runWatchdogSweep(): Promise<void> {
   }
 }
 
-export function reinitializeSessionDebounced(schoolId: string, opts: { force?: boolean } = {}): void {
-  const managed = sessions.get(schoolId);
-  const log = logger.child({ schoolId });
+export function reinitializeSessionDebounced(sessionId: string, opts: { force?: boolean } = {}): void {
+  const managed = sessions.get(sessionId);
+  const log = logger.child({ sessionId });
 
   if (managed?.reinitInFlight) {
     log.debug('reinit already in flight — skipping');
@@ -731,42 +731,42 @@ export function reinitializeSessionDebounced(schoolId: string, opts: { force?: b
       if (managed) {
         await managed.client.destroy().catch(() => { /* dead anyway */ });
       }
-      sessions.delete(schoolId);
+      sessions.delete(sessionId);
       // Reuse initSession's restore path so the saved blob is picked up and
       // the existing init-failed-on-restore self-heal applies.
-      await initSession(schoolId, /* isRestore */ true);
+      await initSession(sessionId, /* isRestore */ true);
       log.info('reinit: kicked off fresh initSession');
     } catch (err) {
       log.error({ err }, 'reinit failed');
     } finally {
-      const m = sessions.get(schoolId);
+      const m = sessions.get(sessionId);
       if (m) m.reinitInFlight = false;
     }
   })();
 }
 
-export async function destroySession(schoolId: string): Promise<void> {
-  const managed = sessions.get(schoolId);
+export async function destroySession(sessionId: string): Promise<void> {
+  const managed = sessions.get(sessionId);
   if (managed) {
     try { await managed.client.logout(); } catch { /* continue */ }
     try { await managed.client.destroy(); } catch { /* continue */ }
-    sessions.delete(schoolId);
+    sessions.delete(sessionId);
   }
-  try { await prisma.whatsAppSession.delete({ where: { schoolId } }); } catch { /* may not exist */ }
+  try { await prisma.whatsAppSession.delete({ where: { sessionId } }); } catch { /* may not exist */ }
   // Drop the cached linkedAt + token bucket so a re-link restarts the
   // warmup curve from day 1.
-  forgetAccount(schoolId);
-  eventBus.publish('session.deleted', { sessionId: schoolId });
+  forgetAccount(sessionId);
+  eventBus.publish('session.deleted', { sessionId: sessionId });
 }
 
 export async function sendMessage(
-  schoolId: string,
+  sessionId: string,
   to: string,
   body: string,
   opts: { override?: boolean } = {},
 ): Promise<SendMessageResult> {
-  const managed = sessions.get(schoolId);
-  const log = logger.child({ schoolId });
+  const managed = sessions.get(sessionId);
+  const log = logger.child({ sessionId });
   // Override only skips ANTI-BAN gates (cooldown, token buckets, jitter).
   // Liveness, auth, and idempotency still apply.
   const override = opts.override === true;
@@ -791,9 +791,9 @@ export async function sendMessage(
   // re-link burst bans) and tell the caller to retry. Placed before the
   // rate-limit checks so a dead session doesn't consume tokens or trip
   // recipient cooldowns.
-  const live = await checkLive(schoolId);
+  const live = await checkLive(sessionId);
   if (live !== 'connected') {
-    reinitializeSessionDebounced(schoolId);
+    reinitializeSessionDebounced(sessionId);
     log.warn({ to, state: live }, 'session unhealthy — returning SESSION_UNHEALTHY');
     return {
       success: false,
@@ -822,7 +822,7 @@ export async function sendMessage(
         timestamp: new Date().toISOString(),
       };
     }
-    const tokens = await consumeRateTokens(schoolId);
+    const tokens = await consumeRateTokens(sessionId);
     if (!tokens.ok) {
       log.warn({ to, code: tokens.code, retryAfter: tokens.retryAfter }, 'messaging-layer rate limit — skipping send');
       return {
@@ -863,9 +863,9 @@ export async function sendMessage(
       // socket is still alive the throw was a genuine lookup miss and we
       // preserve the "not registered" friendly message.
       if (lookupThrew) {
-        const probeLive = await checkLive(schoolId, { force: true });
+        const probeLive = await checkLive(sessionId, { force: true });
         if (probeLive !== 'connected') {
-          reinitializeSessionDebounced(schoolId);
+          reinitializeSessionDebounced(sessionId);
           log.warn({ to, chatId, state: probeLive }, 'getNumberId failure was caused by dead socket — returning SESSION_UNHEALTHY');
           return {
             success: false,
@@ -921,8 +921,8 @@ export async function sendMessage(
   }
 }
 
-function toSchoolSession(schoolId: string, m: ManagedSession): SchoolSession {
-  return { sessionId: schoolId, status: m.status, qrDataUrl: m.qrDataUrl, phoneNumber: m.phoneNumber, lastActivity: m.lastActivity, readySince: m.readySince };
+function toWorkerSession(sessionId: string, m: ManagedSession): WorkerSession {
+  return { sessionId: sessionId, status: m.status, qrDataUrl: m.qrDataUrl, phoneNumber: m.phoneNumber, lastActivity: m.lastActivity, readySince: m.readySince };
 }
 
 /**
