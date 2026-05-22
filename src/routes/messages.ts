@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
 import { sendMessage, checkLive, reinitializeSessionDebounced } from '../sessions';
-import { isQuietHour, sleepJitter, QUIET_HOURS_MESSAGE } from '../anti-ban';
+import { isQuietHour, sleepJitter, getQuietHoursMessage } from '../anti-ban';
 import { quietHoursGuard } from '../middleware/quiet-hours';
 import { messagesSent, messagesFailed, bulkBatchesStarted } from '../metrics';
 import { SendMessageBodySchema, SendBulkBodySchema } from '../openapi';
@@ -201,7 +201,7 @@ router.post('/send-bulk', quietHoursGuard, sendLimiter, idempotency, async (req,
             recipient: m.recipient,
             success: false,
             messageId: null,
-            error: QUIET_HOURS_MESSAGE,
+            error: getQuietHoursMessage(),
             timestamp: new Date().toISOString(),
           }, 0, 1);
           failed++;

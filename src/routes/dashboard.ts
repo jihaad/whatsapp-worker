@@ -161,18 +161,175 @@ const HTML = /* html */ `<!DOCTYPE html>
   .scrollbar-none::-webkit-scrollbar { display: none; }
   .scrollbar-none { scrollbar-width: none; }
 
-  /* Header right-side actions: push to a new line on mid-narrow screens
-     instead of squishing. ml-auto + flex-wrap on the header handles this. */
+
+  /* ===================================================================
+     Mobile responsive layout (≤ 640px and progressive enhancement above)
+     -------------------------------------------------------------------
+     The dashboard is desktop-first by history. The rules below override
+     spacing, typography, and layout for narrow screens so every field
+     (phone, status, time, actions) stays visible and tap-friendly. No
+     colour or design-language changes — purely structural.
+     =================================================================== */
+
+  /* Message rows — vertical-stack on mobile so the phone number never
+     gets clipped by the status pill + timestamp competing for one row.
+     Above 640px the original horizontal layout returns via msg-row-meta. */
+  .msg-row { padding: 14px 16px; }
+  .msg-row .bubble { width: 32px; height: 32px; font-size: 12px; }
+  .msg-row-meta { display: flex; align-items: baseline; gap: 8px; justify-content: space-between; }
+  .msg-row-headline { font-size: 14px; word-break: break-all; margin-top: 2px; }
+  .msg-row-body { font-size: 13px; margin-top: 8px; padding-left: 10px;
+                  border-left: 2px solid rgba(255,255,255,0.08);
+                  color: #d4d4d4; white-space: pre-wrap; word-break: break-word; }
+  .msg-row-chips { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px;
+                   font-size: 11px; font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+  @media (min-width: 640px) {
+    .msg-row { padding: 16px 20px; }
+    .msg-row .bubble { width: 36px; height: 36px; font-size: 14px; }
+    .msg-row-headline { font-size: 15px; margin-top: 0; }
+    .msg-row-chips { gap: 8px; }
+  }
+
+  /* Network rows — on mobile, summary column stacks so status/method are
+     one line and the path is full-width below. */
+  .net-summary { display: flex; flex-wrap: wrap; align-items: center;
+                 gap: 8px 12px; padding: 12px 14px; cursor: pointer; }
+  .net-summary:hover { background: rgba(255,255,255,0.02); }
+  .net-summary .net-status { font-weight: 600; min-width: 36px; }
+  .net-summary .net-method { min-width: 50px; font-weight: 600; font-size: 12px; }
+  .net-summary .net-path { flex: 1 1 100%; order: 5; font-size: 12px;
+                           color: #e5e5e5; word-break: break-all;
+                           font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+  .net-summary .net-latency, .net-summary .net-time { font-size: 11px; }
+  .net-summary .net-caret { margin-left: auto; color: #525252; }
+  @media (min-width: 768px) {
+    .net-summary { flex-wrap: nowrap; padding: 12px 20px; gap: 16px; }
+    .net-summary .net-path { flex: 1 1 auto; order: 0; font-size: 13px; color: #e5e5e5; }
+    .net-summary .net-caret { margin-left: 0; }
+  }
+
+  /* Stat cards — smaller everything on mobile so 4 cards fit in 2×2 without
+     truncation or overflow. */
+  @media (max-width: 639px) {
+    .stat { padding: 14px; }
+    .stat .stat-num { font-size: 28px; }
+    .stat .stat-label { font-size: 10px; letter-spacing: 0.10em; margin-bottom: 6px; }
+    .stat .stat-foot { font-size: 10px; margin-top: 4px; }
+  }
+
+  /* Main grid heights — the desktop calc(100vh - 280px) assumes a single-row
+     stat strip and one-line header. On mobile the stat strip is 2 rows and
+     the header wraps, so use natural flow with sensible min/max heights. */
+  @media (max-width: 1023px) {
+    .messages-pane, .messages-aside { max-height: none !important; }
+    .messages-pane { min-height: 420px; }
+    .messages-aside > div { min-height: 180px; }
+  }
+
+  /* Tab-view panes (Network, Sessions full-tab) — the desktop uses
+     calc(100vh - 90px). On mobile that's measured against a taller wrapped
+     header, so override with min-height to keep the pane usable. */
   @media (max-width: 767px) {
-    .header-actions { margin-left: 0; width: 100%; justify-content: flex-end; }
+    .tab-pane { max-height: none !important; min-height: calc(100vh - 200px) !important; }
+  }
+
+  /* Filter bars (the All/Sent/Failed/Bulk + 2xx/4xx/5xx rows) — let them
+     scroll horizontally on mobile instead of wrapping into ugly multi-line
+     stacks. The session dropdown + count drop onto a second row. */
+  .filter-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 14px; }
+  .filter-bar .seg { overflow-x: auto; max-width: 100%; }
+  .filter-bar .filter-meta { margin-left: auto; }
+  @media (min-width: 768px) {
+    .filter-bar { padding: 16px 20px; gap: 12px; }
+  }
+
+  /* Sessions tab card grid — single column on phones, two on wide. */
+  .sess-grid { display: grid; grid-template-columns: 1fr; gap: 10px; padding: 14px; }
+  @media (min-width: 768px) { .sess-grid { grid-template-columns: 1fr 1fr; gap: 12px; padding: 16px; } }
+
+  /* Section padding utility — px-4 on mobile, px-6 on desktop. */
+  .pane-pad { padding-left: 14px; padding-right: 14px; }
+  @media (min-width: 768px) { .pane-pad { padding-left: 24px; padding-right: 24px; } }
+
+  /* Modal — full-width on phones with edge breathing room; capped on desktop. */
+  .modal-card { width: 100%; max-width: 32rem; padding: 20px; border-radius: 14px; }
+  @media (min-width: 640px) { .modal-card { padding: 28px; border-radius: 16px; } }
+
+  /* QR image inside the New-session modal — never wider than the viewport. */
+  #ns-qr-img { width: 100%; max-width: 280px; height: auto; }
+
+  /* Touch-friendly tap targets on phones */
+  @media (max-width: 767px) {
+    .action-pill, .seg-btn { min-height: 36px; }
+    button { -webkit-tap-highlight-color: rgba(255,255,255,0.06); }
+  }
+
+  /* Header brand-row pills (status / uptime / sessions / quiet-hours) —
+     four of these in a wrap-row can crowd a narrow phone, so tighten
+     padding + typography below 640px. The labels stay readable. */
+  @media (max-width: 639px) {
+    .status-pill { padding: 3px 8px; font-size: 11px; gap: 5px; }
+    .status-pill .dot { width: 7px; height: 7px; }
+  }
+
+  /* Sessions pill in "currently viewing Sessions" state — matches the
+     active mode-tab styling so the operator can see at a glance which
+     view is open. Set via setMode() toggling data-on. */
+  #sess-stat-pill[data-on="true"] {
+    background: var(--bg-elev);
+    border-color: var(--border-2);
+    color: #ededed;
   }
 </style>
 </head>
 <body class="stage min-h-screen">
 
+<!-- Quiet-hours editor modal — opened by clicking the quiet-hours pill -->
+<div id="quiet-modal" class="hidden fixed inset-0 z-40 flex items-center justify-center p-4 overflow-y-auto" style="background: rgba(0,0,0,0.85); backdrop-filter: blur(8px);">
+  <form id="quiet-form" class="surface-elev modal-card max-w-md shadow-2xl my-auto">
+    <div class="flex items-start justify-between mb-1">
+      <h2 class="text-xl font-semibold">Quiet hours</h2>
+      <button id="quiet-close" type="button" class="text-neutral-500 hover:text-neutral-200 transition-colors text-lg leading-none">×</button>
+    </div>
+    <p class="text-sm text-neutral-400 mb-5">Sends outside this window return 503 + <code class="mono text-neutral-200 bg-neutral-900 px-1.5 py-0.5 rounded text-xs">QUIET_HOURS</code>. Set start=0 and end=24 to send anytime.</p>
+
+    <label class="flex items-center gap-2 mb-4 cursor-pointer select-none">
+      <input id="quiet-always" type="checkbox" class="accent-emerald-500" />
+      <span class="text-sm text-neutral-300">Always live (no quiet window)</span>
+    </label>
+
+    <div id="quiet-window-fields" class="grid grid-cols-2 gap-3 mb-4">
+      <div>
+        <label class="block text-[11px] uppercase tracking-wider text-neutral-500 mb-1.5">Start hour</label>
+        <input id="quiet-start" type="number" min="0" max="23" step="1"
+               class="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 mono text-sm focus:outline-none focus:border-emerald-500/60 transition-colors" />
+      </div>
+      <div>
+        <label class="block text-[11px] uppercase tracking-wider text-neutral-500 mb-1.5">End hour</label>
+        <input id="quiet-end" type="number" min="1" max="24" step="1"
+               class="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 mono text-sm focus:outline-none focus:border-emerald-500/60 transition-colors" />
+      </div>
+    </div>
+
+    <label class="block text-[11px] uppercase tracking-wider text-neutral-500 mb-1.5">Timezone</label>
+    <input id="quiet-tz" type="text" autocomplete="off" placeholder="Africa/Nairobi"
+           class="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 mono text-sm focus:outline-none focus:border-emerald-500/60 transition-colors" />
+    <p class="text-[11px] text-neutral-500 mt-1.5">IANA timezone name. Examples: <code class="mono text-neutral-300">Africa/Nairobi</code>, <code class="mono text-neutral-300">Europe/London</code>, <code class="mono text-neutral-300">America/New_York</code>.</p>
+    <p id="quiet-tz-disabled-note" class="hidden text-[11px] text-amber-400/80 mt-1.5">⚠ Timezone has no effect while <strong>Always live</strong> is on — the worker skips the time check entirely. Saved value is kept for when a window is re-enabled.</p>
+
+    <div id="quiet-error" class="hidden mt-3 text-[12px] text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-lg px-3 py-2"></div>
+
+    <div class="mt-5 flex gap-2 justify-end">
+      <button id="quiet-cancel" type="button" class="surface-elev rounded-lg px-4 py-2 text-sm text-neutral-300 hover:text-neutral-100">Cancel</button>
+      <button id="quiet-save" type="submit" class="bg-emerald-500 hover:bg-emerald-400 text-neutral-950 rounded-lg px-4 py-2 text-sm font-semibold transition-colors">Save</button>
+    </div>
+    <p class="text-[11px] text-neutral-500 mt-3">Saved to <code class="mono text-neutral-300">.env</code> on the worker host — survives restart.</p>
+  </form>
+</div>
+
 <!-- Auth modal -->
 <div id="auth-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4" style="background: rgba(0,0,0,0.85); backdrop-filter: blur(8px);">
-  <form id="auth-form" class="surface-elev rounded-2xl p-7 w-full max-w-md shadow-2xl">
+  <form id="auth-form" class="surface-elev modal-card shadow-2xl">
     <h2 class="text-xl font-semibold mb-1">Worker secret</h2>
     <p class="text-sm text-neutral-400 mb-5">Paste your <code class="mono text-neutral-200 bg-neutral-900 px-1.5 py-0.5 rounded">WHATSAPP_WORKER_SECRET</code>. Stored in sessionStorage only.</p>
     <input id="auth-input" type="password" autocomplete="off" autofocus
@@ -183,45 +340,67 @@ const HTML = /* html */ `<!DOCTYPE html>
   </form>
 </div>
 
-<!-- ===== Header ===== -->
-<header class="relative z-10 px-4 sm:px-6 py-3 hairline border-b flex flex-wrap items-center gap-x-3 gap-y-2">
-  <!-- Brand + state pills -->
-  <div class="flex items-center gap-2 sm:gap-3 min-w-0">
-    <div class="w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-semibold shrink-0">W</div>
-    <h1 class="text-sm sm:text-base font-semibold tracking-tight truncate">WhatsApp Worker</h1>
-  </div>
+<!-- ===== Header =====
+     Three independent regions in a parent flex. On mobile (flex-col) each
+     region becomes its own full-width row, so the mode tabs can't crash
+     into the action chips. On lg+ (flex-row + lg:items-center) they
+     collapse into a single row: brand pills · tabs · actions, with
+     lg:ml-auto on the actions block pushing it to the right edge. -->
+<header class="relative z-10 px-3 sm:px-6 py-3 hairline border-b">
+  <div class="flex flex-col lg:flex-row lg:items-center gap-2 lg:gap-3">
+    <!-- Brand + state pills -->
+    <div class="flex flex-wrap items-center gap-2 sm:gap-3 min-w-0">
+      <div class="w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-semibold shrink-0">W</div>
+      <h1 class="text-sm sm:text-base font-semibold tracking-tight truncate">WhatsApp Worker</h1>
+      <div id="status" class="status-pill text-neutral-400">
+        <span class="dot bg-neutral-500"></span>
+        <span>disconnected</span>
+      </div>
+      <div class="status-pill text-neutral-400" title="Worker process uptime">
+        <span class="text-neutral-500 text-[10px] uppercase tracking-wider">up</span>
+        <span id="worker-uptime" class="num text-neutral-200">—</span>
+      </div>
+      <!-- Active sessions — counts from the in-memory lastSessions list,
+           updated live by session.* SSE events. Click jumps to Sessions
+           view (this pill replaces the old Sessions tab button). -->
+      <button id="sess-stat-pill" class="status-pill text-neutral-400 cursor-pointer hover:text-neutral-200 hover:border-neutral-700 transition-colors" title="Active sessions — click to open Sessions view">
+        <span class="dot bg-neutral-500" id="sess-stat-dot"></span>
+        <span class="text-neutral-500 text-[10px] uppercase tracking-wider">sessions</span>
+        <span id="sess-stat-text" class="num text-neutral-200">0 / 0</span>
+      </button>
+      <!-- Quiet-hours state — click to edit window. Colour reflects current
+           mode: emerald = live, amber = quiet, neutral = always-live config. -->
+      <button id="quiet-pill" class="status-pill text-neutral-400 cursor-pointer hover:text-neutral-200 hover:border-neutral-700 transition-colors" title="Quiet hours — click to edit">
+        <span class="dot bg-neutral-500" id="quiet-pill-dot"></span>
+        <span id="quiet-pill-label" class="text-neutral-200">—</span>
+        <span id="quiet-pill-window" class="text-neutral-500 text-[10px] num">—</span>
+      </button>
+    </div>
 
-  <div id="status" class="status-pill text-neutral-400">
-    <span class="dot bg-neutral-500"></span>
-    <span>disconnected</span>
-  </div>
+    <!-- Mode tabs — own row on mobile, scrolls horizontally on overflow.
+         Sessions tab is reached via the "sessions" pill on the brand row;
+         keeping it out of the tab bar avoids redundancy. -->
+    <div class="seg rounded-lg p-1 flex gap-1 overflow-x-auto scrollbar-none self-stretch lg:self-auto">
+      <button data-mode="messages" class="mode-btn seg-btn is-active flex-1 lg:flex-initial px-3 sm:px-4 py-1.5 rounded-md text-xs font-medium whitespace-nowrap">Messages</button>
+      <button data-mode="network"  class="mode-btn seg-btn flex-1 lg:flex-initial px-3 sm:px-4 py-1.5 rounded-md text-xs font-medium whitespace-nowrap">Network <span class="count" id="cnt-net">0</span></button>
+    </div>
 
-  <div class="status-pill text-neutral-400" title="Worker process uptime">
-    <span class="text-neutral-500 text-[10px] uppercase tracking-wider">up</span>
-    <span id="worker-uptime" class="num text-neutral-200">—</span>
-  </div>
-
-  <!-- View mode tabs — scroll horizontally on very narrow screens -->
-  <div class="seg rounded-lg p-1 flex gap-1 overflow-x-auto scrollbar-none">
-    <button data-mode="messages" class="mode-btn seg-btn is-active px-3 sm:px-4 py-1.5 rounded-md text-xs font-medium whitespace-nowrap">Messages</button>
-    <button data-mode="network"  class="mode-btn seg-btn px-3 sm:px-4 py-1.5 rounded-md text-xs font-medium whitespace-nowrap">Network <span class="count" id="cnt-net">0</span></button>
-    <button data-mode="sessions" class="mode-btn seg-btn px-3 sm:px-4 py-1.5 rounded-md text-xs font-medium whitespace-nowrap">Sessions <span class="count" id="cnt-sess">0</span></button>
-  </div>
-
-  <!-- Right-side actions — pill style matches mode-btn aesthetic, wraps below on mobile -->
-  <div class="header-actions flex items-center gap-1.5 ml-auto">
-    <button id="reveal-btn" class="action-pill" data-on="false" title="Toggle full phone-number display (off = last-4 masked)">
-      <span class="action-icon" aria-hidden="true">○</span>
-      <span class="action-label">Show numbers</span>
-    </button>
-    <button id="clear-feed" class="action-pill" title="Clear the current tab's local cache (server data is untouched)">
-      <span class="action-icon" aria-hidden="true">✕</span>
-      <span class="action-label">Clear</span>
-    </button>
-    <button id="logout" class="action-pill" title="Forget the stored worker secret on this device">
-      <span class="action-icon" aria-hidden="true">⎋</span>
-      <span class="action-label">Forget secret</span>
-    </button>
+    <!-- Action chips — own row on mobile (right-aligned via justify-end);
+         on desktop, ml-auto pushes them to the right edge of the header. -->
+    <div class="flex items-center gap-1.5 justify-end lg:ml-auto">
+      <button id="reveal-btn" class="action-pill" data-on="false" title="Toggle full phone-number display (off = last-4 masked)">
+        <span class="action-icon" aria-hidden="true">○</span>
+        <span class="action-label">Show numbers</span>
+      </button>
+      <button id="clear-feed" class="action-pill" title="Clear the current tab's local cache (server data is untouched)">
+        <span class="action-icon" aria-hidden="true">✕</span>
+        <span class="action-label">Clear</span>
+      </button>
+      <button id="logout" class="action-pill" title="Forget the stored worker secret on this device">
+        <span class="action-icon" aria-hidden="true">⎋</span>
+        <span class="action-label">Forget secret</span>
+      </button>
+    </div>
   </div>
 </header>
 
@@ -230,60 +409,66 @@ const HTML = /* html */ `<!DOCTYPE html>
 <!-- ============================================================ -->
 <div id="view-messages">
 
-<!-- ===== Stat strip ===== -->
-<section class="px-6 py-5 relative z-10">
+<!-- ===== Stat strip =====
+     2×2 on phones (stat .stat-num gets resized via media query), 4×1 on lg+. -->
+<section class="pane-pad py-4 sm:py-5 relative z-10">
   <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
     <div class="stat rounded-xl p-5">
-      <div class="text-xs uppercase tracking-[0.14em] text-neutral-500 mb-2.5">Sent</div>
-      <div id="m-sent" class="num text-4xl font-semibold text-emerald-400">0</div>
-      <div class="mt-2 flex items-center gap-1.5 text-[11px] text-neutral-500">
+      <div class="stat-label text-xs uppercase tracking-[0.14em] text-neutral-500 mb-2.5">Sent</div>
+      <div id="m-sent" class="stat-num num text-4xl font-semibold text-emerald-400">0</div>
+      <div class="stat-foot mt-2 flex items-center gap-1.5 text-[11px] text-neutral-500">
         <span class="dot bg-emerald-500/60"></span> delivered to WhatsApp
       </div>
     </div>
     <div class="stat rounded-xl p-5">
-      <div class="text-xs uppercase tracking-[0.14em] text-neutral-500 mb-2.5">Failed</div>
-      <div id="m-failed" class="num text-4xl font-semibold text-rose-400">0</div>
-      <div class="mt-2 flex items-center gap-1.5 text-[11px] text-neutral-500">
+      <div class="stat-label text-xs uppercase tracking-[0.14em] text-neutral-500 mb-2.5">Failed</div>
+      <div id="m-failed" class="stat-num num text-4xl font-semibold text-rose-400">0</div>
+      <div class="stat-foot mt-2 flex items-center gap-1.5 text-[11px] text-neutral-500">
         <span class="dot bg-rose-500/60"></span> upstream + rate-limit
       </div>
     </div>
     <div class="stat rounded-xl p-5">
-      <div class="text-xs uppercase tracking-[0.14em] text-neutral-500 mb-2.5">Success rate</div>
-      <div id="m-rate" class="num text-4xl font-semibold text-neutral-200">—</div>
-      <div class="mt-2 flex items-center gap-1.5 text-[11px] text-neutral-500">
+      <div class="stat-label text-xs uppercase tracking-[0.14em] text-neutral-500 mb-2.5">Success rate</div>
+      <div id="m-rate" class="stat-num num text-4xl font-semibold text-neutral-200">—</div>
+      <div class="stat-foot mt-2 flex items-center gap-1.5 text-[11px] text-neutral-500">
         sent / (sent + failed)
       </div>
     </div>
     <div class="stat rounded-xl p-5">
-      <div class="text-xs uppercase tracking-[0.14em] text-neutral-500 mb-2.5">Throughput</div>
+      <div class="stat-label text-xs uppercase tracking-[0.14em] text-neutral-500 mb-2.5">Throughput</div>
       <div class="flex items-baseline gap-2">
-        <div id="m-throughput" class="num text-4xl font-semibold text-sky-400">0</div>
+        <div id="m-throughput" class="stat-num num text-4xl font-semibold text-sky-400">0</div>
         <div class="text-xs text-neutral-500">msgs / min</div>
       </div>
-      <div class="mt-2 flex items-center gap-1.5 text-[11px] text-neutral-500">
+      <div class="stat-foot mt-2 flex items-center gap-1.5 text-[11px] text-neutral-500">
         rolling 60s window
       </div>
     </div>
   </div>
 </section>
 
-<!-- ===== Main grid ===== -->
-<main class="px-6 pb-6 grid grid-cols-1 lg:grid-cols-7 gap-4 relative z-10" style="min-height: calc(100vh - 280px)">
+<!-- ===== Main grid =====
+     Mobile: stacked single column with natural height (panes use min-height
+     via .messages-pane / .messages-aside in CSS). Desktop ≥ lg: 7-col grid
+     with rigid calc(100vh - 280px) height so messages + sidebar both have
+     internal scroll. -->
+<main class="pane-pad pb-6 grid grid-cols-1 lg:grid-cols-7 gap-4 relative z-10 lg:min-h-[calc(100vh-280px)]">
 
   <!-- Messages -->
-  <section class="lg:col-span-5 surface rounded-xl flex flex-col overflow-hidden" style="max-height: calc(100vh - 280px)">
-    <!-- Filter tab bar (big) -->
-    <div class="p-4 hairline border-b flex items-center flex-wrap gap-3">
-      <div class="seg rounded-xl p-1 flex gap-1">
-        <button data-filter="all"    class="seg-btn is-active px-5 py-2.5 rounded-lg text-sm font-medium">All     <span class="count" id="cnt-all">0</span></button>
-        <button data-filter="sent"   class="seg-btn px-5 py-2.5 rounded-lg text-sm font-medium">Sent    <span class="count" id="cnt-sent">0</span></button>
-        <button data-filter="failed" class="seg-btn px-5 py-2.5 rounded-lg text-sm font-medium">Failed  <span class="count" id="cnt-failed">0</span></button>
-        <button data-filter="bulk"   class="seg-btn px-5 py-2.5 rounded-lg text-sm font-medium">Bulk    <span class="count" id="cnt-bulk">0</span></button>
+  <section class="messages-pane lg:col-span-5 surface rounded-xl flex flex-col overflow-hidden lg:max-h-[calc(100vh-280px)]">
+    <!-- Filter tab bar — uses .filter-bar so paddings + horizontal scroll
+         are uniform with the Network / Sessions filter bars on mobile. -->
+    <div class="filter-bar hairline border-b">
+      <div class="seg rounded-xl p-1 flex gap-1 scrollbar-none">
+        <button data-filter="all"    class="seg-btn is-active px-3 sm:px-5 py-2 sm:py-2.5 rounded-lg text-sm font-medium whitespace-nowrap">All     <span class="count" id="cnt-all">0</span></button>
+        <button data-filter="sent"   class="seg-btn px-3 sm:px-5 py-2 sm:py-2.5 rounded-lg text-sm font-medium whitespace-nowrap">Sent    <span class="count" id="cnt-sent">0</span></button>
+        <button data-filter="failed" class="seg-btn px-3 sm:px-5 py-2 sm:py-2.5 rounded-lg text-sm font-medium whitespace-nowrap">Failed  <span class="count" id="cnt-failed">0</span></button>
+        <button data-filter="bulk"   class="seg-btn px-3 sm:px-5 py-2 sm:py-2.5 rounded-lg text-sm font-medium whitespace-nowrap">Bulk    <span class="count" id="cnt-bulk">0</span></button>
       </div>
-      <select id="session-filter" class="bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-xs mono text-neutral-300 hover:border-neutral-700 focus:outline-none focus:border-emerald-500/60 transition-colors">
+      <select id="session-filter" class="bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-xs mono text-neutral-300 hover:border-neutral-700 focus:outline-none focus:border-emerald-500/60 transition-colors max-w-[180px] sm:max-w-none truncate">
         <option value="">All sessions</option>
       </select>
-      <span id="feed-count" class="ml-auto text-xs text-neutral-500 num">0 events</span>
+      <span id="feed-count" class="filter-meta text-xs text-neutral-500 num">0 events</span>
     </div>
 
     <div id="messages" class="flex-1 overflow-auto"></div>
@@ -295,9 +480,9 @@ const HTML = /* html */ `<!DOCTYPE html>
   </section>
 
   <!-- Sidebar -->
-  <aside class="lg:col-span-2 flex flex-col gap-4" style="max-height: calc(100vh - 280px)">
+  <aside class="messages-aside lg:col-span-2 flex flex-col gap-4 lg:max-h-[calc(100vh-280px)]">
     <!-- Sessions card -->
-    <div class="surface rounded-xl flex flex-col overflow-hidden flex-1 min-h-[200px]">
+    <div class="surface rounded-xl flex flex-col overflow-hidden flex-1">
       <div class="px-4 py-3 hairline border-b flex items-center justify-between">
         <div class="text-xs uppercase tracking-[0.14em] text-neutral-500 font-medium">Sessions</div>
         <div class="flex items-center gap-2">
@@ -309,7 +494,7 @@ const HTML = /* html */ `<!DOCTYPE html>
     </div>
 
     <!-- System events card -->
-    <div class="surface rounded-xl flex flex-col overflow-hidden flex-1 min-h-[200px]">
+    <div class="surface rounded-xl flex flex-col overflow-hidden flex-1">
       <div class="px-4 py-3 hairline border-b text-xs uppercase tracking-[0.14em] text-neutral-500 font-medium">
         System events
       </div>
@@ -324,21 +509,21 @@ const HTML = /* html */ `<!DOCTYPE html>
 <!-- ============================================================ -->
 <!-- VIEW: Network ================================================ -->
 <!-- ============================================================ -->
-<div id="view-network" class="hidden px-6 py-5 relative z-10">
-  <section class="surface rounded-xl flex flex-col overflow-hidden" style="max-height: calc(100vh - 90px); min-height: calc(100vh - 90px);">
-    <div class="p-4 hairline border-b flex items-center gap-3 flex-wrap">
-      <div class="seg rounded-xl p-1 flex gap-1">
-        <button data-net-filter="all"    class="net-btn seg-btn is-active px-5 py-2.5 rounded-lg text-sm font-medium">All     <span class="count" id="cnt-net-all">0</span></button>
-        <button data-net-filter="2xx"    class="net-btn seg-btn px-5 py-2.5 rounded-lg text-sm font-medium">2xx     <span class="count" id="cnt-net-2xx">0</span></button>
-        <button data-net-filter="4xx"    class="net-btn seg-btn px-5 py-2.5 rounded-lg text-sm font-medium">4xx     <span class="count" id="cnt-net-4xx">0</span></button>
-        <button data-net-filter="5xx"    class="net-btn seg-btn px-5 py-2.5 rounded-lg text-sm font-medium">5xx     <span class="count" id="cnt-net-5xx">0</span></button>
+<div id="view-network" class="hidden pane-pad py-4 sm:py-5 relative z-10">
+  <section class="tab-pane surface rounded-xl flex flex-col overflow-hidden" style="max-height: calc(100vh - 90px); min-height: calc(100vh - 90px);">
+    <div class="filter-bar hairline border-b">
+      <div class="seg rounded-xl p-1 flex gap-1 scrollbar-none">
+        <button data-net-filter="all"    class="net-btn seg-btn is-active px-3 sm:px-5 py-2 sm:py-2.5 rounded-lg text-sm font-medium whitespace-nowrap">All     <span class="count" id="cnt-net-all">0</span></button>
+        <button data-net-filter="2xx"    class="net-btn seg-btn px-3 sm:px-5 py-2 sm:py-2.5 rounded-lg text-sm font-medium whitespace-nowrap">2xx     <span class="count" id="cnt-net-2xx">0</span></button>
+        <button data-net-filter="4xx"    class="net-btn seg-btn px-3 sm:px-5 py-2 sm:py-2.5 rounded-lg text-sm font-medium whitespace-nowrap">4xx     <span class="count" id="cnt-net-4xx">0</span></button>
+        <button data-net-filter="5xx"    class="net-btn seg-btn px-3 sm:px-5 py-2 sm:py-2.5 rounded-lg text-sm font-medium whitespace-nowrap">5xx     <span class="count" id="cnt-net-5xx">0</span></button>
       </div>
       <label class="flex items-center gap-2 text-xs text-neutral-400 cursor-pointer select-none hover:text-neutral-200 transition-colors">
         <input id="show-internal" type="checkbox" class="accent-amber-500" />
         <span>show internal</span>
         <span id="cnt-internal" class="text-[10px] text-neutral-600 num">(0 hidden)</span>
       </label>
-      <span id="net-count" class="ml-auto text-xs text-neutral-500 num">0 requests</span>
+      <span id="net-count" class="filter-meta text-xs text-neutral-500 num">0 requests</span>
     </div>
     <div id="network" class="flex-1 overflow-auto"></div>
     <div id="network-empty" class="hidden flex-1 flex flex-col items-center justify-center text-center px-6 py-12">
@@ -353,16 +538,16 @@ const HTML = /* html */ `<!DOCTYPE html>
 <!-- ============================================================ -->
 <!-- VIEW: Sessions =============================================== -->
 <!-- ============================================================ -->
-<div id="view-sessions" class="hidden px-6 py-5 relative z-10">
-  <section class="surface rounded-xl flex flex-col overflow-hidden" style="max-height: calc(100vh - 90px); min-height: calc(100vh - 90px);">
-    <div class="p-4 hairline border-b flex items-center gap-3 flex-wrap">
-      <button id="sess-new" class="bg-emerald-500 hover:bg-emerald-400 text-neutral-950 rounded-lg px-4 py-2 text-sm font-semibold transition-colors flex items-center gap-2">
+<div id="view-sessions" class="hidden pane-pad py-4 sm:py-5 relative z-10">
+  <section class="tab-pane surface rounded-xl flex flex-col overflow-hidden" style="max-height: calc(100vh - 90px); min-height: calc(100vh - 90px);">
+    <div class="filter-bar hairline border-b">
+      <button id="sess-new" class="bg-emerald-500 hover:bg-emerald-400 text-neutral-950 rounded-lg px-4 py-2 text-sm font-semibold transition-colors flex items-center gap-2 whitespace-nowrap">
         <span class="text-base leading-none">+</span> New session
       </button>
-      <button id="sess-refresh-tab" class="surface-elev rounded-lg px-3 py-2 text-xs text-neutral-300 hover:text-neutral-100 hover:border-neutral-600 transition-colors">⟳ Refresh</button>
-      <span id="sess-summary" class="ml-auto text-xs text-neutral-500 num"></span>
+      <button id="sess-refresh-tab" class="surface-elev rounded-lg px-3 py-2 text-xs text-neutral-300 hover:text-neutral-100 hover:border-neutral-600 transition-colors whitespace-nowrap">⟳ Refresh</button>
+      <span id="sess-summary" class="filter-meta text-xs text-neutral-500 num"></span>
     </div>
-    <div id="sess-list" class="flex-1 overflow-auto p-4 grid grid-cols-1 lg:grid-cols-2 gap-3 auto-rows-min"></div>
+    <div id="sess-list" class="flex-1 overflow-auto sess-grid auto-rows-min"></div>
     <div id="sess-empty" class="hidden flex-1 flex flex-col items-center justify-center text-center px-6 py-12">
       <div class="w-14 h-14 rounded-2xl bg-neutral-900 border border-neutral-800 flex items-center justify-center text-2xl mb-4">📱</div>
       <div class="text-neutral-300 font-medium mb-1">No sessions linked yet</div>
@@ -375,8 +560,8 @@ const HTML = /* html */ `<!DOCTYPE html>
 <!-- ============================================================ -->
 <!-- MODAL: New session =========================================== -->
 <!-- ============================================================ -->
-<div id="new-session-modal" class="hidden fixed inset-0 z-40 flex items-center justify-center p-4" style="background: rgba(0,0,0,0.85); backdrop-filter: blur(8px);">
-  <div class="surface-elev rounded-2xl p-7 w-full max-w-lg shadow-2xl">
+<div id="new-session-modal" class="hidden fixed inset-0 z-40 flex items-center justify-center p-4 overflow-y-auto" style="background: rgba(0,0,0,0.85); backdrop-filter: blur(8px);">
+  <div class="surface-elev modal-card max-w-lg shadow-2xl my-auto">
     <div class="flex items-start justify-between mb-1">
       <h2 class="text-xl font-semibold">New session</h2>
       <button id="ns-close" class="text-neutral-500 hover:text-neutral-200 transition-colors text-lg leading-none">×</button>
@@ -553,7 +738,7 @@ function updateSessionFilterOptions() {
 
 function renderMessageRow(ev) {
   const row = document.createElement('div');
-  row.className = 'row px-5 py-4 hairline border-b transition-colors' + (ev.replay ? ' replay' : '');
+  row.className = 'row msg-row hairline border-b transition-colors' + (ev.replay ? ' replay' : '');
 
   const d = ev.data || {};
   const isSent   = ev.type === 'message.sent';
@@ -584,15 +769,17 @@ function renderMessageRow(ev) {
     ? '<span class="ml-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider bg-rose-500/20 border border-rose-500/40 text-rose-300" title="Sent with X-Worker-Override — anti-ban gates bypassed">⚠ Override</span>'
     : '';
 
-  // Primary line (the headline of the row)
-  let headline = '';
+  // Headline content (recipient phone for sends, summary for bulk). Always
+  // rendered on its OWN line below the status/time row, so on mobile a long
+  // phone number can't get clipped by the timestamp competing for width.
+  let headlineInner = '';
   if (isSent || isFailed) {
-    headline = '<span class="text-neutral-100 mono text-[15px]">' + maskPhone(d.recipient) + '</span>';
+    headlineInner = '<span class="text-neutral-100 mono">' + maskPhone(d.recipient) + '</span>';
   } else if (isBulkS) {
-    headline = '<span class="text-neutral-100 text-[15px]">' + d.total + ' messages queued</span>';
+    headlineInner = '<span class="text-neutral-100">' + d.total + ' messages queued</span>';
   } else if (isBulkC) {
     const total = Number(d.total ?? 0); const ok = Number(d.succeeded ?? 0); const bad = Number(d.failed ?? 0);
-    headline = '<span class="text-neutral-100 text-[15px]">' + ok + ' of ' + total + ' sent</span>'
+    headlineInner = '<span class="text-neutral-100">' + ok + ' of ' + total + ' sent</span>'
       + (bad > 0 ? ' <span class="text-rose-400">· ' + bad + ' failed</span>' : '');
   }
 
@@ -623,21 +810,25 @@ function renderMessageRow(ev) {
   if ((isSent || isFailed) && typeof d.body === 'string' && d.body.length > 0) {
     const truncated = d.body.length > 600 ? d.body.slice(0, 600) + '…' : d.body;
     const escaped = truncated.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-    bodyBlock =
-      '    <div class="mt-2 pl-3 border-l-2 border-neutral-800 text-[13px] text-neutral-300 whitespace-pre-wrap break-words">' + escaped + '</div>';
+    bodyBlock = '<div class="msg-row-body">' + escaped + '</div>';
   }
 
+  // Layout: bubble + content column. Content has three stacked sections —
+  // (1) meta row: status pill (+ override badge) on the left, timestamp on
+  // the right. (2) headline (recipient phone / bulk summary) on its own
+  // line so it can break-all on small viewports. (3) optional body. (4)
+  // optional chips row (session/batch/msg/resend).
   row.innerHTML =
-    '<div class="flex items-start gap-4">' +
+    '<div class="flex items-start gap-3 sm:gap-4">' +
     '  <div class="bubble ' + bubbleCls + '">' + bubbleIcon + '</div>' +
     '  <div class="flex-1 min-w-0">' +
-    '    <div class="flex items-baseline gap-3 flex-wrap">' +
-    '      <div class="text-xs font-semibold uppercase tracking-wide">' + statusLabel + overrideBadge + '</div>' +
-    '      <div class="flex-1 truncate min-w-0">' + headline + '</div>' +
+    '    <div class="msg-row-meta">' +
+    '      <div class="text-xs font-semibold uppercase tracking-wide flex items-center">' + statusLabel + overrideBadge + '</div>' +
     '      <div class="text-[11px] text-neutral-500 num shrink-0">' + timeStr(ev.ts) + '</div>' +
     '    </div>' +
+    (headlineInner ? '<div class="msg-row-headline">' + headlineInner + '</div>' : '') +
     bodyBlock +
-    (chips.length ? '    <div class="mt-2 flex flex-wrap gap-2 text-[11px] mono">' + chips.join('') + '</div>' : '') +
+    (chips.length ? '<div class="msg-row-chips">' + chips.join('') + '</div>' : '') +
     '  </div>' +
     '</div>';
 
@@ -839,6 +1030,7 @@ function renderSessions() {
     idEl.addEventListener('click', () => copyToClipboard(idEl.dataset.copy, idEl));
     box.appendChild(row);
   }
+  updateSessionsPill();
 }
 
 // ---------- network panel ----------
@@ -893,17 +1085,17 @@ function renderNetworkRow(req) {
   const slow = req.latencyMs > 1000;
 
   const summary = document.createElement('div');
-  summary.className = 'px-5 py-3 flex items-center gap-4 cursor-pointer hover:bg-white/[0.02] transition-colors';
+  summary.className = 'net-summary';
   summary.innerHTML =
-    '<span class="' + sc + ' num font-semibold w-12 shrink-0">' + req.status + '</span>' +
-    '<span class="' + mc + ' mono text-[12px] w-16 shrink-0 font-semibold">' + req.method + '</span>' +
-    '<span class="mono text-[13px] text-neutral-200 flex-1 truncate min-w-0">' + escapeHtml(req.path) + '</span>' +
-    '<span class="num text-[12px] ' + (slow ? 'text-amber-400' : 'text-neutral-500') + ' shrink-0">' + req.latencyMs + 'ms</span>' +
-    '<span class="text-[11px] text-neutral-500 num shrink-0">' + timeStr(req.ts) + '</span>' +
-    '<span class="text-neutral-600 text-xs shrink-0">▸</span>';
+    '<span class="net-status ' + sc + ' num">' + req.status + '</span>' +
+    '<span class="net-method ' + mc + ' mono">' + req.method + '</span>' +
+    '<span class="net-latency num ' + (slow ? 'text-amber-400' : 'text-neutral-500') + '">' + req.latencyMs + 'ms</span>' +
+    '<span class="net-time text-neutral-500 num">' + timeStr(req.ts) + '</span>' +
+    '<span class="net-caret">▸</span>' +
+    '<span class="net-path">' + escapeHtml(req.path) + '</span>';
 
   const detail = document.createElement('div');
-  detail.className = 'hidden px-5 pb-4 grid grid-cols-1 lg:grid-cols-2 gap-4 text-[12px]';
+  detail.className = 'hidden px-4 sm:px-5 pb-4 grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4 text-[12px]';
 
   const headersBlock = req.reqHeaders
     ? Object.entries(req.reqHeaders).map(([k, v]) => '<div class="mono"><span class="text-neutral-500">' + escapeHtml(k) + ':</span> <span class="text-neutral-300">' + escapeHtml(typeof v === 'string' ? v : JSON.stringify(v)) + '</span></div>').join('')
@@ -934,8 +1126,8 @@ function renderNetworkRow(req) {
 
   summary.addEventListener('click', () => {
     detail.classList.toggle('hidden');
-    const caret = summary.lastChild;
-    if (caret && caret.textContent) caret.textContent = detail.classList.contains('hidden') ? '▸' : '▾';
+    const caret = summary.querySelector('.net-caret');
+    if (caret) caret.textContent = detail.classList.contains('hidden') ? '▸' : '▾';
   });
 
   wrap.appendChild(summary);
@@ -1212,13 +1404,19 @@ $('show-internal').addEventListener('change', (e) => {
 });
 
 // View mode (Messages / Network / Sessions)
+//
+// Sessions has no mode-btn in the tab bar (it's reached via the header
+// session pill instead), so the active-class assignment is null-safe with
+// ?.classList. The pill itself toggles a data-on="true" attribute so the
+// operator gets visual feedback that the Sessions view is currently open.
 function setMode(mode) {
   currentMode = mode;
   for (const b of document.querySelectorAll('.mode-btn[data-mode]')) b.classList.remove('is-active');
-  document.querySelector('.mode-btn[data-mode="' + mode + '"]').classList.add('is-active');
+  document.querySelector('.mode-btn[data-mode="' + mode + '"]')?.classList.add('is-active');
   $('view-messages').classList.toggle('hidden', mode !== 'messages');
   $('view-network').classList.toggle('hidden',  mode !== 'network');
   $('view-sessions').classList.toggle('hidden', mode !== 'sessions');
+  $('sess-stat-pill').setAttribute('data-on', mode === 'sessions' ? 'true' : 'false');
   if (mode === 'sessions') renderSessionsTab();
 }
 for (const btn of document.querySelectorAll('.mode-btn[data-mode]')) {
@@ -1309,7 +1507,8 @@ function renderSessionsTab() {
   const empty = $('sess-empty');
   const summary = $('sess-summary');
   const ready = lastSessions.filter((s) => s.status === 'ready').length;
-  $('cnt-sess').textContent = lastSessions.length;
+  // Count badge on the tab button was removed when the Sessions mode tab
+  // was deleted (the header session pill already shows the count).
   summary.textContent = lastSessions.length + ' total · ' + ready + ' ready';
 
   if (lastSessions.length === 0) {
@@ -1360,9 +1559,9 @@ function renderSessionsTab() {
 
     detail.innerHTML =
       qrBlock +
-      '<div class="grid grid-cols-2 gap-2 text-[11px]">' +
-      '  <div><div class="text-neutral-500">last activity</div><div class="text-neutral-300 mono">' + (s.lastActivity || '—') + '</div></div>' +
-      '  <div><div class="text-neutral-500">phone</div><div class="text-neutral-300 mono">' + (s.phoneNumber ? maskPhone(s.phoneNumber) : '—') + '</div></div>' +
+      '<div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]">' +
+      '  <div><div class="text-neutral-500">last activity</div><div class="text-neutral-300 mono break-all">' + (s.lastActivity || '—') + '</div></div>' +
+      '  <div><div class="text-neutral-500">phone</div><div class="text-neutral-300 mono break-all">' + (s.phoneNumber ? maskPhone(s.phoneNumber) : '—') + '</div></div>' +
       '</div>' +
       '<div class="flex gap-2 pt-1 flex-wrap">' +
       '  <button data-act="refresh" data-sid="' + sid + '" class="surface-elev rounded-md px-3 py-1.5 text-xs text-neutral-300 hover:text-neutral-100">⟳ Refresh</button>' +
@@ -1553,6 +1752,142 @@ $('ns-gen').addEventListener('click', () => {
 $('ns-submit').addEventListener('click', nsStartLinking);
 $('ns-id').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); nsStartLinking(); } });
 
+// ---------- Header pills: active sessions + quiet hours ----------
+
+function updateSessionsPill() {
+  const total = lastSessions.length;
+  const ready = lastSessions.filter((s) => s.status === 'ready').length;
+  $('sess-stat-text').textContent = ready + ' / ' + total;
+  const dot = $('sess-stat-dot');
+  // Colour: emerald = all ready, amber = some down, neutral = none yet.
+  if (total === 0)            dot.className = 'dot bg-neutral-500';
+  else if (ready === total)   dot.className = 'dot bg-emerald-500';
+  else if (ready === 0)       dot.className = 'dot bg-rose-500';
+  else                        dot.className = 'dot bg-amber-500';
+}
+
+let quietCfg = null;  // { start, end, tz, state, retryAfter }
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+function paintQuietPill() {
+  if (!quietCfg) return;
+  const alwaysLive = quietCfg.start === 0 && quietCfg.end === 24;
+  const isQuiet = quietCfg.state === 'quiet';
+  const label = alwaysLive ? 'Always live' : (isQuiet ? 'Quiet' : 'Live');
+  const window = alwaysLive ? '24h' : (pad2(quietCfg.start) + '–' + pad2(quietCfg.end));
+  $('quiet-pill-label').textContent = label;
+  $('quiet-pill-window').textContent = window;
+  const dot = $('quiet-pill-dot');
+  if (alwaysLive)     dot.className = 'dot bg-neutral-500';
+  else if (isQuiet)   dot.className = 'dot bg-amber-500';
+  else                dot.className = 'dot bg-emerald-500';
+}
+
+async function fetchQuietHours() {
+  try {
+    const r = await fetch('/v1/config/quiet-hours', { headers: INTERNAL_HEADERS() });
+    if (!r.ok) { if (r.status === 401) promptForSecret(); return; }
+    quietCfg = await r.json();
+    paintQuietPill();
+  } catch (err) { console.warn('fetchQuietHours:', err); }
+}
+
+// Re-paint Live/Quiet every minute — the window boundary is hour-precision
+// so polling every 60s is plenty. No new fetch needed unless config changed.
+setInterval(() => {
+  if (!quietCfg) return;
+  const alwaysLive = quietCfg.start === 0 && quietCfg.end === 24;
+  if (alwaysLive) { quietCfg.state = 'live'; paintQuietPill(); return; }
+  const now = new Date();
+  // Use Intl to extract the hour in the configured tz.
+  const fmt = new Intl.DateTimeFormat('en-GB', { timeZone: quietCfg.tz, hour: 'numeric', hour12: false });
+  const hour = parseInt(fmt.format(now), 10);
+  const isQuiet = hour < quietCfg.start || hour >= quietCfg.end;
+  quietCfg.state = isQuiet ? 'quiet' : 'live';
+  paintQuietPill();
+}, 60_000);
+
+// Click pill → jump to Sessions tab.
+$('sess-stat-pill').addEventListener('click', () => setMode('sessions'));
+
+// Quiet-hours modal open / close / save.
+function openQuietModal() {
+  if (!quietCfg) { fetchQuietHours().then(openQuietModal); return; }
+  $('quiet-error').classList.add('hidden');
+  $('quiet-start').value = quietCfg.start;
+  $('quiet-end').value   = quietCfg.end;
+  $('quiet-tz').value    = quietCfg.tz;
+  const alwaysLive = quietCfg.start === 0 && quietCfg.end === 24;
+  $('quiet-always').checked = alwaysLive;
+  $('quiet-window-fields').style.opacity = alwaysLive ? '0.4' : '';
+  $('quiet-start').disabled = alwaysLive;
+  $('quiet-end').disabled = alwaysLive;
+  $('quiet-tz-disabled-note').classList.toggle('hidden', !alwaysLive);
+  $('quiet-modal').classList.remove('hidden');
+}
+function closeQuietModal() { $('quiet-modal').classList.add('hidden'); }
+
+$('quiet-pill').addEventListener('click', openQuietModal);
+$('quiet-close').addEventListener('click', closeQuietModal);
+$('quiet-cancel').addEventListener('click', closeQuietModal);
+
+$('quiet-always').addEventListener('change', (e) => {
+  const on = e.target.checked;
+  $('quiet-window-fields').style.opacity = on ? '0.4' : '';
+  $('quiet-start').disabled = on;
+  $('quiet-end').disabled = on;
+  $('quiet-tz-disabled-note').classList.toggle('hidden', !on);
+  if (on) { $('quiet-start').value = 0; $('quiet-end').value = 24; }
+});
+
+$('quiet-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const start = Number($('quiet-start').value);
+  const end   = Number($('quiet-end').value);
+  const tz    = $('quiet-tz').value.trim();
+  const errBox = $('quiet-error');
+  errBox.classList.add('hidden');
+
+  if (!Number.isInteger(start) || start < 0 || start > 23) { showQuietError('Start must be 0–23'); return; }
+  if (!Number.isInteger(end)   || end   < 1 || end   > 24) { showQuietError('End must be 1–24'); return; }
+  if (end <= start) { showQuietError('End must be greater than start'); return; }
+  if (!tz)          { showQuietError('Timezone is required'); return; }
+
+  const saveBtn = $('quiet-save');
+  saveBtn.disabled = true;
+  saveBtn.style.opacity = '0.6';
+  saveBtn.textContent = 'Saving…';
+  try {
+    const r = await fetch('/v1/config/quiet-hours', {
+      method: 'PUT',
+      headers: { ...INTERNAL_HEADERS(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ start, end, tz }),
+    });
+    if (!r.ok) {
+      let msg = 'HTTP ' + r.status;
+      try { const body = await r.json(); if (body?.error?.message) msg = body.error.message; } catch {}
+      showQuietError(msg);
+      return;
+    }
+    quietCfg = await r.json();
+    paintQuietPill();
+    closeQuietModal();
+  } catch (err) {
+    showQuietError(err instanceof Error ? err.message : String(err));
+  } finally {
+    saveBtn.disabled = false;
+    saveBtn.style.opacity = '';
+    saveBtn.textContent = 'Save';
+  }
+});
+
+function showQuietError(msg) {
+  const box = $('quiet-error');
+  box.textContent = msg;
+  box.classList.remove('hidden');
+}
+
 async function start() {
   const cached = loadCache();
   if (cached.length) mergeAndRender(cached.map((ev) => ({ ...ev, replay: true })));
@@ -1564,6 +1899,9 @@ async function start() {
   // refresh button on the Sessions card. Polling was purely cosmetic — the
   // WhatsApp Web keepalive is owned by Chromium, not the HTTP endpoint.
   refreshSessions();
+  // Quiet-hours config — one-shot fetch on connect. Updates come from the
+  // settings modal's PUT response or the 60s re-paint timer.
+  fetchQuietHours();
   setInterval(saveCache, 5000);
   streamEvents();
 }

@@ -16,6 +16,7 @@ import messagesRouter from './routes/messages';
 import eventsRouter from './routes/events';
 import dashboardRouter from './routes/dashboard';
 import faviconRouter from './routes/favicon';
+import configRouter from './routes/config';
 
 // whatsapp-web.js fires async `framenavigated` events without try/catch. When
 // WhatsApp Web navigates mid-inject, Puppeteer throws "Execution context was
@@ -112,6 +113,7 @@ app.use('/events', eventsRouter);
 // Versioned API surface. Breaking changes go in /v2, not by mutating /v1.
 app.use('/v1/sessions', sessionsRouter);
 app.use('/v1/messages', messagesRouter);
+app.use('/v1/config',   configRouter);
 
 app.get('/metrics', async (_, res) => {
   res.set('Content-Type', registry.contentType);

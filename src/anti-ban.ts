@@ -20,6 +20,14 @@
  * Both are part of the basic anti-ban posture. The route composes them in
  * order: quiet-hours guard first (fail fast), then await the jitter, then
  * call `sendMessage`.
+ *
+ * **Quiet-hours config is mutable at runtime.** The dashboard exposes a
+ * settings modal that hits PUT /v1/config/quiet-hours, which calls
+ * `setQuietHoursConfig` here AND rewrites the on-disk `.env` so the new
+ * window survives restarts. `process.env` itself is loaded once on boot
+ * by src/prisma.ts via `process.loadEnvFile('.env')` — we don't re-read
+ * it; we just mutate this module-local state and rebuild the
+ * Intl formatters when the timezone changes.
  */
 
 // --- Jitter --------------------------------------------------------------
@@ -39,50 +47,105 @@ export function sleepJitter(): Promise<void> {
 
 // --- Quiet hours ---------------------------------------------------------
 
-export const QUIET_HOUR_START = Number(process.env.QUIET_HOUR_START ?? 7);
-export const QUIET_HOUR_END   = Number(process.env.QUIET_HOUR_END   ?? 21);
-export const QUIET_HOUR_TZ    = process.env.QUIET_HOUR_TZ ?? 'Africa/Nairobi';
+export interface QuietHoursConfig {
+  /** Inclusive lower bound of the send window, hour 0–23. */
+  start: number;
+  /** Exclusive upper bound, hour 1–24. start === 0 && end === 24 means always live. */
+  end: number;
+  /** IANA timezone (e.g. `Africa/Nairobi`, `Europe/London`). */
+  tz: string;
+}
 
-const pad = (h: number) => String(h).padStart(2, '0');
-export const QUIET_HOURS_MESSAGE =
-  `Quiet hours — sends paused outside ${pad(QUIET_HOUR_START)}:00–${pad(QUIET_HOUR_END)}:00 (${QUIET_HOUR_TZ})`;
+const cfg: QuietHoursConfig = {
+  start: Number(process.env.QUIET_HOUR_START ?? 7),
+  end:   Number(process.env.QUIET_HOUR_END   ?? 21),
+  tz:    process.env.QUIET_HOUR_TZ ?? 'Africa/Nairobi',
+};
 
-// Reuse a single formatter instance — Intl.DateTimeFormat construction is
-// expensive and these are called on every send request.
-const eatHourFmt = new Intl.DateTimeFormat('en-GB', {
-  timeZone: QUIET_HOUR_TZ, hour: 'numeric', hour12: false,
-});
-const eatPartsFmt = new Intl.DateTimeFormat('en-GB', {
-  timeZone: QUIET_HOUR_TZ,
-  hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false,
-});
+// Lazy-initialised formatters — `Intl.DateTimeFormat` is expensive to
+// construct so we cache one of each. Rebuilt whenever the timezone changes.
+let eatHourFmt = buildHourFmt(cfg.tz);
+let eatPartsFmt = buildPartsFmt(cfg.tz);
 
-/** True when local time in the configured timezone is outside the send window. */
-export function isQuietHour(now: Date = new Date()): boolean {
-  // `Intl` with explicit IANA TZ — works regardless of the host's system clock.
-  const hh = eatHourFmt.format(now);
-  const hour = parseInt(hh, 10);
-  return hour < QUIET_HOUR_START || hour >= QUIET_HOUR_END;
+function buildHourFmt(tz: string): Intl.DateTimeFormat {
+  return new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: 'numeric', hour12: false });
+}
+function buildPartsFmt(tz: string): Intl.DateTimeFormat {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz,
+    hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false,
+  });
+}
+
+/** Read-only snapshot of the current quiet-hours config. */
+export function getQuietHoursConfig(): QuietHoursConfig {
+  return { ...cfg };
 }
 
 /**
- * Seconds until the next 07:00 EAT, suitable for an HTTP `Retry-After`
- * header when rejecting a send during quiet hours. Caps at 24h to keep
- * the value sane on clock drift.
+ * Replace the active quiet-hours config in-process. Caller is responsible
+ * for persisting to `.env` via writeEnvVars if the change should survive a
+ * restart. Throws if the supplied tz isn't a valid IANA zone.
+ */
+export function setQuietHoursConfig(next: QuietHoursConfig): void {
+  if (!Number.isInteger(next.start) || next.start < 0 || next.start > 23) {
+    throw new RangeError('start must be an integer 0–23');
+  }
+  if (!Number.isInteger(next.end) || next.end < 1 || next.end > 24) {
+    throw new RangeError('end must be an integer 1–24');
+  }
+  if (next.end <= next.start) {
+    throw new RangeError('end must be greater than start (rollover windows are not supported)');
+  }
+  // Validate tz by trying to instantiate a formatter; Intl throws on
+  // unrecognised zones (e.g. 'Atlantis/Lost').
+  try { new Intl.DateTimeFormat('en-GB', { timeZone: next.tz }); }
+  catch { throw new RangeError(`Unknown IANA timezone: ${next.tz}`); }
+
+  const tzChanged = next.tz !== cfg.tz;
+  cfg.start = next.start;
+  cfg.end   = next.end;
+  cfg.tz    = next.tz;
+  if (tzChanged) {
+    eatHourFmt  = buildHourFmt(cfg.tz);
+    eatPartsFmt = buildPartsFmt(cfg.tz);
+  }
+}
+
+const pad = (h: number) => String(h).padStart(2, '0');
+
+/** Reason string used in the 503 envelope and surfaced in the dashboard. */
+export function getQuietHoursMessage(): string {
+  return `Quiet hours — sends paused outside ${pad(cfg.start)}:00–${pad(cfg.end)}:00 (${cfg.tz})`;
+}
+
+/** True when local time in the configured timezone is outside the send window. */
+export function isQuietHour(now: Date = new Date()): boolean {
+  // start === 0 && end === 24 = always live — short-circuit to avoid
+  // formatter cost on every send when quiet hours are effectively disabled.
+  if (cfg.start === 0 && cfg.end === 24) return false;
+  const hour = parseInt(eatHourFmt.format(now), 10);
+  return hour < cfg.start || hour >= cfg.end;
+}
+
+/**
+ * Seconds until the next start-of-window in the configured timezone,
+ * suitable for an HTTP `Retry-After` header. Caps at 24h to keep the
+ * value sane on clock drift.
  */
 export function secondsUntilNextSendWindow(now: Date = new Date()): number {
-  const eatNow = eatPartsFmt.formatToParts(now);
-  const get = (type: string) => parseInt(eatNow.find((p) => p.type === type)?.value ?? '0', 10);
+  const parts = eatPartsFmt.formatToParts(now);
+  const get = (type: string) => parseInt(parts.find((p) => p.type === type)?.value ?? '0', 10);
   const hour = get('hour');
   const minute = get('minute');
   const second = get('second');
 
   const nowSec = hour * 3600 + minute * 60 + second;
-  const startSec = QUIET_HOUR_START * 3600;
+  const startSec = cfg.start * 3600;
   const dayLen = 24 * 3600;
 
-  // Currently before 07:00 → wait until 07:00 today.
-  // Currently >= 21:00     → wait until 07:00 tomorrow.
+  // Currently before start → wait until start today.
+  // Currently >= end       → wait until start tomorrow.
   const remaining = nowSec < startSec
     ? startSec - nowSec
     : (dayLen - nowSec) + startSec;
