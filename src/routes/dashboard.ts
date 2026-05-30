@@ -1406,6 +1406,12 @@ async function fetchRecent() {
 
 function mergeAndRender(events) {
   for (const ev of events) {
+    // Delivery/read acks are not feed rows — fold them into the message they
+    // belong to (seeds messageAcks so the sent row renders the right ticks)
+    // instead of listing them. The live SSE path already does this via
+    // handleEvent; this covers the /events/recent + localStorage replays,
+    // which would otherwise render a generic "message.ack" row per ack.
+    if (ev.type === 'message.ack') { applyAck(ev); continue; }
     const k = eventKey(ev);
     if (seenKeys.has(k)) continue;
     seenKeys.add(k);
