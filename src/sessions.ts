@@ -3,9 +3,11 @@ import * as QRCode from 'qrcode';
 import { DatabaseAuth } from './database-auth';
 import { prisma } from './prisma';
 import { logger } from './logger';
-import { eventBus } from './events';
-import { checkRecipientCooldown, consumeRateTokens, recordRecipientSend, forgetAccount } from './lib/messaging-limits';
+import { eventBus, type WorkerEvent } from './events';
+import { checkRecipientCooldown, consumeRateTokens, recordRecipientSend, forgetAccount, checkAccountSpacing, recordAccountSend, type LimitCode } from './lib/messaging-limits';
 import { varyBody } from './lib/body-variation';
+import { alertSessionProblem } from './lib/operator-alerts';
+import { ackLabel } from './lib/ack';
 
 /**
  * Long-lived session manager for the WhatsApp worker process.
@@ -44,7 +46,7 @@ export interface SendMessageResult {
   // Populated when the send was blocked by a messaging-layer rate limit
   // (recipient cooldown, per-account / global / warmup). The route handler
   // checks for this and maps to HTTP 429 with the standard error envelope.
-  rateLimit?: { code: 'RECIPIENT_COOLDOWN' | 'ACCOUNT_RATE_LIMIT' | 'WARMUP_LIMIT' | 'GLOBAL_RATE_LIMIT'; retryAfter: number };
+  rateLimit?: { code: LimitCode; retryAfter: number };
   // Populated when the WhatsApp Web socket is dead (or unresponsive). The
   // route handler maps to HTTP 503 SESSION_UNHEALTHY. Distinct from
   // "phone not on WhatsApp" so the caller knows to retry, not to fix the
@@ -74,6 +76,11 @@ interface ManagedSession {
   // True while a reinit is running. Other reinit requests during this
   // window are no-ops to avoid concurrent destroy/init races.
   reinitInFlight?: boolean;
+  // ms-timestamp of when status most recently became `connecting`. Used by
+  // the watchdog to detect a session wedged in `connecting` — one where WA
+  // Web never fired a terminal (ready/qr/disconnected) event. Set on every
+  // entry into `connecting`; only read while status === 'connecting'.
+  connectingSince?: number;
 }
 
 const sessions = new Map<string, ManagedSession>();
@@ -196,6 +203,7 @@ export async function initSession(sessionId: string, isRestore = false): Promise
     phoneNumber: null,
     lastActivity: new Date().toISOString(),
     readySince: null,
+    connectingSince: Date.now(),
   };
   sessions.set(sessionId, managed);
 
@@ -218,6 +226,7 @@ export async function initSession(sessionId: string, isRestore = false): Promise
         qrSeen = true;
         log.warn('restore rejected by WhatsApp — dropping stale blob');
         await prisma.whatsAppSession.delete({ where: { sessionId } }).catch(() => {});
+        alertSessionProblem(sessionId, 'restore_rejected', 'WhatsApp rejected the saved login on restart — a fresh QR scan is needed');
       }
     } catch {
       managed.qrDataUrl = null;
@@ -273,6 +282,7 @@ export async function initSession(sessionId: string, isRestore = false): Promise
       status: 'connecting', phoneNumber: managed.phoneNumber, qrDataUrl: null, lastActivity: managed.lastActivity,
     });
     managed.status = 'connecting';
+    managed.connectingSince = Date.now();
     managed.lastActivity = new Date().toISOString();
   });
 
@@ -311,8 +321,26 @@ export async function initSession(sessionId: string, isRestore = false): Promise
     }
   });
 
+  // Outbound delivery/read receipts. whatsapp-web.js fires message_ack as the
+  // recipient's device confirms our sent messages: ack climbs -1→0→1→2→3(→4).
+  // We only care about our own (fromMe) messages — inbound acks are noise. The
+  // messageId here matches what sendMessage returned (msg.id.id), so callers
+  // can correlate. Covers single AND bulk sends — acks are per-message off the
+  // client, independent of how the message was queued.
+  client.on('message_ack', (msg, ack: number) => {
+    if (!msg.fromMe) return;
+    eventBus.publish('message.ack', {
+      sessionId,
+      recipient: typeof msg.to === 'string' ? msg.to.replace(/@c\.us$/, '') : null,
+      messageId: msg.id?.id ?? null,
+      ack,
+      ackLabel: ackLabel(ack),
+    });
+  });
+
   client.on('auth_failure', (msg) => {
     log.error({ msg }, 'auth failure');
+    alertSessionProblem(sessionId, 'auth_failure', String(msg));
     eventBus.publish('session.auth_failure', {
       sessionId: sessionId, reason: String(msg),
       status: 'disconnected', phoneNumber: managed.phoneNumber, qrDataUrl: null, lastActivity: managed.lastActivity,
@@ -605,6 +633,20 @@ export async function listSessions(opts: { limit: number; cursor?: string } = { 
 const STATE_CHECK_TIMEOUT_MS = 1500;
 const STATE_CHECK_CACHE_MS = 5_000;
 const REINIT_COOLDOWN_MS = 15 * 60 * 1000;
+// How long a session may sit in `connecting` before the watchdog treats it as
+// wedged (WA Web never fired ready/qr/disconnected). Well past the ~40s worst
+// case for a healthy cold boot + staggered restore. Override via env.
+const STUCK_CONNECTING_MS = Number(process.env.STUCK_CONNECTING_MS) || 3 * 60_000;
+
+// Backoff for the watchdog's DB-reconcile re-init. Without it, a session that
+// fails to init throws every 5-min sweep — repeated WA re-auth attempts that
+// read as the "logging in repeatedly" pattern WhatsApp flags. After a failed
+// attempt we wait this long before retrying that sessionId, and alert the
+// operator once a session has failed RECONCILE_ALERT_AFTER times in a row.
+const RECONCILE_COOLDOWN_MS = Number(process.env.RECONCILE_COOLDOWN_MS) || 30 * 60_000;
+const RECONCILE_ALERT_AFTER = 3;
+// sessionId → { lastAttempt ms, consecutive failures }. Cleared on success.
+const reconcileAttempts = new Map<string, { lastAttempt: number; failures: number }>();
 
 export async function checkLive(sessionId: string, opts: { force?: boolean } = {}): Promise<'connected' | 'disconnected' | 'unknown'> {
   const managed = sessions.get(sessionId);
@@ -652,40 +694,39 @@ export async function checkLive(sessionId: string, opts: { force?: boolean } = {
 }
 
 /**
- * Reinitialise a session whose socket has died. Ban-safety guarded:
- *   - In-flight lock prevents concurrent destroy/init.
- *   - 15-minute cooldown between attempts caps the WhatsApp re-auth burst
- *     rate. Without this, a barrage of sends to a dead session would each
- *     trigger an init, which WA's bot detector will flag.
- *
- * Returns immediately if either guard would skip the attempt. The caller
- * still gets a 503 SESSION_UNHEALTHY from the surrounding send path; we're
- * accepting some delay before the session recovers in exchange for not
- * burning the linked phone.
- */
-/**
  * Watchdog sweep — runs every 5 min from src/lib/session-watchdog.ts.
  *
- * Two passes:
+ * Four passes, all ban-safety-capped (see invariant #4):
  *   1. `ready` sessions: forced checkLive() to catch silent socket deaths.
- *      checkLive flips status → disconnected on failure (handler keeps the
- *      entry in the map, see client.on('disconnected') above).
- *   2. `disconnected` sessions: trigger reinitializeSessionDebounced.
- *      No `force` — the 15-min cooldown means at most one reinit attempt
- *      per session per cooldown window, which is the ban-safety contract
- *      we're committed to. First sweep after a network drop attempts a
- *      reinit; subsequent sweeps within the cooldown are skipped.
+ *      checkLive flips status → disconnected on failure (the handler keeps
+ *      the entry in the map, see client.on('disconnected') above).
+ *   2. `disconnected` sessions: reinitializeSessionDebounced (15-min cooldown,
+ *      so at most one reinit per session per window).
+ *   3. sessions wedged in `connecting` past STUCK_CONNECTING_MS (WA Web never
+ *      fired a terminal event): alert the operator + cooldown-guarded reinit.
+ *   4. DB reconcile: re-init any saved session missing from memory (boot
+ *      restore failed / init threw), with its own backoff (RECONCILE_COOLDOWN_MS)
+ *      and an alert after RECONCILE_ALERT_AFTER consecutive failures.
  *
- * Net effect: short network blip on the host → session disconnects → next
- * 5-min sweep auto-reconnects without operator action. Longer outages or
- * persistent reinit failure still need a manual Reconnect from the dashboard.
+ * Net effect: a network blip or a restart self-heals within ~5 min with no
+ * operator action; only a rejected auth blob (needs a fresh QR) or repeated
+ * failures escalate to an alert.
  */
 export async function runWatchdogSweep(): Promise<void> {
   const readyIds: string[] = [];
   const disconnectedIds: string[] = [];
+  const stuckConnecting: { id: string; ms: number }[] = [];
+  const now = Date.now();
   for (const [id, m] of sessions.entries()) {
     if (m.status === 'ready') readyIds.push(id);
     else if (m.status === 'disconnected') disconnectedIds.push(id);
+    else if (
+      m.status === 'connecting' &&
+      m.connectingSince &&
+      now - m.connectingSince >= STUCK_CONNECTING_MS
+    ) {
+      stuckConnecting.push({ id, ms: now - m.connectingSince });
+    }
   }
   for (const id of readyIds) {
     await checkLive(id, { force: true }).catch(() => {});
@@ -696,8 +737,91 @@ export async function runWatchdogSweep(): Promise<void> {
     // reinits for the same session if a send arrives while we're working.
     reinitializeSessionDebounced(id);
   }
+  // Sessions wedged in `connecting` — WA Web never fired a terminal event
+  // (page load / handshake stalled). Invisible to the two passes above, so
+  // without this they'd sit forever until a send happened to hit them. Alert
+  // the operator AND nudge a cooldown-guarded reinit so it can self-heal
+  // (tears down the wedged Chromium and re-inits from the saved blob).
+  for (const { id, ms } of stuckConnecting) {
+    logger.child({ sessionId: id }).warn({ stuckForMs: ms }, 'session wedged in connecting — alerting + reinit');
+    alertSessionProblem(id, 'stuck_connecting', `Stuck connecting for ${Math.round(ms / 60_000)} min — WhatsApp Web never finished loading`);
+    reinitializeSessionDebounced(id);
+  }
+
+  // Reconcile against the DB so every saved session comes back after a
+  // restart with NO manual intervention. The boot-time restoreSessions()
+  // handles the normal case, but it gives up if the DB is unreachable for
+  // ~30s at boot, and an init that throws drops its entry from the map
+  // entirely — both leave a saved session with no live client and nothing
+  // (the passes above only see in-memory sessions) to retry it. Here we
+  // re-init any saved session that isn't live or already starting.
+  //
+  // Safe against re-auth loops: a session whose blob WhatsApp rejected has
+  // its DB row deleted on the restore-rejected path (and alerts), so it
+  // won't reappear here — only sessions with a still-valid blob are retried.
+  try {
+    const saved = await prisma.whatsAppSession.findMany({ select: { sessionId: true } });
+    const now2 = Date.now();
+    const missing = saved
+      .map((r) => r.sessionId)
+      .filter((id) => !sessions.has(id) && !initializing.has(id))
+      // Back off sessions that recently failed to re-init — retrying every
+      // 5-min sweep would hammer WhatsApp's re-auth path (ban risk). Once a
+      // sessionId has gone RECONCILE_COOLDOWN_MS since its last attempt it's
+      // eligible again.
+      .filter((id) => {
+        const rec = reconcileAttempts.get(id);
+        return !rec || now2 - rec.lastAttempt >= RECONCILE_COOLDOWN_MS;
+      });
+    let i = 0;
+    for (const id of missing) {
+      logger.child({ sessionId: id }).warn('watchdog: saved session missing from memory — re-initialising');
+      initializing.add(id);
+      const prevFailures = reconcileAttempts.get(id)?.failures ?? 0;
+      reconcileAttempts.set(id, { lastAttempt: Date.now(), failures: prevFailures });
+      // Stagger Chromium launches (same contention reason as restoreSessions).
+      const delay = i * 3_000;
+      i++;
+      setTimeout(() => {
+        if (sessions.has(id)) { initializing.delete(id); return; }
+        initSession(id, /* isRestore */ true)
+          .then(() => {
+            // Init kicked off cleanly — reset the failure counter. (If it then
+            // wedges in `connecting`, the stuck-connecting pass handles it.)
+            reconcileAttempts.delete(id);
+          })
+          .catch((err) => {
+            const failures = (reconcileAttempts.get(id)?.failures ?? 0) + 1;
+            reconcileAttempts.set(id, { lastAttempt: Date.now(), failures });
+            logger.error({ err, sessionId: id, failures }, `watchdog: re-init failed — backing off ${Math.round(RECONCILE_COOLDOWN_MS / 60_000)}min`);
+            if (failures >= RECONCILE_ALERT_AFTER) {
+              alertSessionProblem(id, 'connect_timeout', `Auto-recovery failed ${failures}× in a row — manual reset likely needed`);
+            }
+            sessions.delete(id);
+          })
+          .finally(() => initializing.delete(id));
+      }, delay).unref();
+    }
+  } catch (err) {
+    // DB still unreachable — next sweep retries. Don't let it abort the rest
+    // of the watchdog.
+    logger.warn({ err }, 'watchdog: DB reconcile read failed — will retry next sweep');
+  }
 }
 
+/**
+ * Reinitialise a session whose socket has died. Ban-safety guarded:
+ *   - In-flight lock prevents concurrent destroy/init.
+ *   - 15-minute cooldown between attempts caps the WhatsApp re-auth burst
+ *     rate. Without this, a barrage of sends to a dead session would each
+ *     trigger an init, which WA's bot detector will flag. `force: true`
+ *     (explicit operator action) bypasses the cooldown, not the in-flight lock.
+ *
+ * Returns immediately if either guard would skip the attempt. The caller
+ * still gets a 503 SESSION_UNHEALTHY from the surrounding send path; we're
+ * accepting some delay before the session recovers in exchange for not
+ * burning the linked phone.
+ */
 export function reinitializeSessionDebounced(sessionId: string, opts: { force?: boolean } = {}): void {
   const managed = sessions.get(sessionId);
   const log = logger.child({ sessionId });
@@ -747,16 +871,138 @@ export function reinitializeSessionDebounced(sessionId: string, opts: { force?: 
 
 export async function destroySession(sessionId: string): Promise<void> {
   const managed = sessions.get(sessionId);
+  const log = logger.child({ sessionId });
   if (managed) {
-    try { await managed.client.logout(); } catch { /* continue */ }
-    try { await managed.client.destroy(); } catch { /* continue */ }
+    // Cap each teardown step so DELETE always returns promptly — a session
+    // wedged in `connecting`/`qr_pending` has a Chromium page that never
+    // finished loading, and client.logout()/destroy() can hang on it
+    // indefinitely (logout especially: it drives a WA-Web UI flow that
+    // requires a live page). A leaked browser process is the lesser evil
+    // than a hung request; the next pm2 restart reaps it.
+    const TEARDOWN_TIMEOUT_MS = 10_000;
+    const withTimeout = (p: Promise<unknown>, label: string) =>
+      Promise.race([
+        Promise.resolve(p).catch(() => { /* swallow — best-effort */ }),
+        new Promise<void>((resolve) => setTimeout(() => {
+          log.warn({ label }, 'session teardown step timed out — forcing drop');
+          resolve();
+        }, TEARDOWN_TIMEOUT_MS)),
+      ]);
+    // Only attempt a clean WA-side logout when the session is actually live;
+    // on a non-ready session there's nothing meaningful to log out of and the
+    // call is the most likely to hang.
+    if (managed.status === 'ready') await withTimeout(managed.client.logout(), 'logout');
+    await withTimeout(managed.client.destroy(), 'destroy');
     sessions.delete(sessionId);
   }
   try { await prisma.whatsAppSession.delete({ where: { sessionId } }); } catch { /* may not exist */ }
   // Drop the cached linkedAt + token bucket so a re-link restarts the
-  // warmup curve from day 1.
+  // warmup curve from day 1, and clear any watchdog reconcile backoff so a
+  // re-linked session with the same id isn't penalised by stale failures.
   forgetAccount(sessionId);
+  reconcileAttempts.delete(sessionId);
   eventBus.publish('session.deleted', { sessionId: sessionId });
+}
+
+// How long a send will wait for a not-ready session to come up before
+// giving up and returning a retry. Covers Chromium cold boot (~20s) plus a
+// little slack. Override via env for constrained hosts.
+const SEND_RESTORE_WAIT_MS = Number(process.env.SEND_RESTORE_WAIT_MS) || 30_000;
+
+/**
+ * Ensure a session is live before a send. On a cold or just-restarted worker
+ * the target session may not be in the in-memory map yet (restoreSessions()
+ * is still working through its 3s-staggered launches) or may be mid-connect.
+ * Rather than bounce the caller, bring this session up NOW — jumping the
+ * restore queue — and wait (bounded) for it to reach `ready`.
+ *
+ * Returns the ready ManagedSession, or null if it couldn't be made ready
+ * within `timeoutMs` (genuinely unlinked, blob rejected → qr_pending, or
+ * still booting). The caller distinguishes those cases for its response.
+ *
+ * Reinit policy is preserved (WA ratelimits re-link attempts — invariant #4):
+ * a `disconnected` session is nudged via the cooldown-guarded debounced
+ * reinit, never a forced one; a never-loaded session uses the normal
+ * restore-path initSession.
+ */
+async function ensureSessionReady(
+  sessionId: string,
+  timeoutMs = SEND_RESTORE_WAIT_MS,
+): Promise<ManagedSession | null> {
+  const log = logger.child({ sessionId });
+  let managed = sessions.get(sessionId);
+  if (managed?.status === 'ready') return managed;
+
+  // Wait event-driven, not by polling: the lifecycle already publishes
+  // `session.ready` (and `session.qr` / `session.auth_failure` for the
+  // failure cases) on the bus. Subscribe BEFORE we trigger any bring-up or
+  // re-read the map, so a fast transition can't fire in the gap and be missed
+  // (check-then-wait race). The timer is a backstop for the case where no
+  // terminal event ever arrives (e.g. Chromium wedged mid-launch).
+  let onEvent!: (e: WorkerEvent) => void;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = new Promise<void>((resolve) => {
+    onEvent = (e) => {
+      if (e.data?.sessionId !== sessionId) return;
+      if (
+        e.type === 'session.ready' ||
+        e.type === 'session.qr' ||
+        e.type === 'session.auth_failure'
+      ) {
+        resolve();
+      }
+    };
+    eventBus.on('event', onEvent);
+    timer = setTimeout(resolve, timeoutMs);
+    timer.unref?.();
+  });
+
+  try {
+    if (!managed) {
+      // Not in the map. If no restore is already queued/running AND there's
+      // no saved blob, there's nothing to bring up — bail so the caller
+      // returns "link WhatsApp first".
+      if (!initializing.has(sessionId)) {
+        const hasSaved = await prisma.whatsAppSession
+          .findUnique({ where: { sessionId }, select: { sessionId: true } })
+          .catch(() => null);
+        if (!hasSaved) return null;
+      }
+      // Start the restore now — jumps the restoreSessions() stagger for THIS
+      // session. initSession is idempotent: if the staggered timer is already
+      // mid-flight it returns the existing snapshot, and the queued timer
+      // no-ops once the map is populated.
+      initSession(sessionId, /* isRestore */ true).catch((err) =>
+        log.error({ err }, 'ensureSessionReady: restore init failed'),
+      );
+    } else if (managed.status === 'disconnected') {
+      reinitializeSessionDebounced(sessionId); // cooldown-guarded, never forced
+    } else if (managed.status === 'qr_pending') {
+      return null; // blob rejected — needs a fresh QR scan; nothing to wait for
+    }
+    // `connecting` falls straight through to the wait below.
+
+    // Re-read after subscribing — covers a flip to `ready` between our first
+    // read and the listener being attached.
+    managed = sessions.get(sessionId);
+    if (managed?.status === 'ready') return managed;
+
+    await settled; // wakes on this session's next ready/qr/auth_failure, or the timeout
+    managed = sessions.get(sessionId);
+    if (managed?.status !== 'ready') {
+      log.warn({ timeoutMs, status: managed?.status }, 'ensureSessionReady: not ready within window');
+      // qr_pending / auth_failure already alert from their own handlers; this
+      // covers the "stuck connecting / never came up" case so the operator
+      // still gets pinged when a send can't connect.
+      if (managed?.status !== 'qr_pending') {
+        alertSessionProblem(sessionId, 'connect_timeout', `Session did not reach 'ready' within ${Math.round(timeoutMs / 1000)}s of a send attempt`);
+      }
+    }
+    return managed?.status === 'ready' ? managed : null;
+  } finally {
+    eventBus.off('event', onEvent);
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export async function sendMessage(
@@ -765,23 +1011,60 @@ export async function sendMessage(
   body: string,
   opts: { override?: boolean } = {},
 ): Promise<SendMessageResult> {
-  const managed = sessions.get(sessionId);
+  let managed = sessions.get(sessionId);
   const log = logger.child({ sessionId });
-  // Override only skips ANTI-BAN gates (cooldown, token buckets, jitter).
-  // Liveness, auth, and idempotency still apply.
+  // Override only skips ANTI-BAN gates (per-account spacing, recipient
+  // cooldown, token buckets, jitter). Liveness, auth, and idempotency still apply.
   const override = opts.override === true;
   if (override) {
     log.warn({ to }, 'OVERRIDE — anti-ban gates bypassed for this send (high ban risk)');
   }
 
   if (!managed || managed.status !== 'ready') {
-    return {
-      success: false,
-      messageId: null,
-      recipientPhone: to,
-      error: managed ? `Session not ready (${managed.status})` : 'No active session — link WhatsApp first.',
-      timestamp: new Date().toISOString(),
-    };
+    // Don't bounce the caller on a cold/just-restarted worker. On a
+    // power-loss / network-drop restart, restoreSessions() is still working
+    // through its 3s-staggered launches, so the session may not be in the map
+    // yet (or may be mid-connect). Actively bring THIS session up — jumping
+    // the restore queue — and wait for it to reach `ready` before sending.
+    managed = (await ensureSessionReady(sessionId)) ?? undefined;
+
+    if (!managed) {
+      // Couldn't make it ready within the window. Distinguish a still-restoring
+      // session (tell the caller to retry via SESSION_UNHEALTHY → 503) from a
+      // genuinely unlinked one (needs a fresh QR scan).
+      const current = sessions.get(sessionId);
+      const status = current?.status;
+      const restoring =
+        status === 'connecting' ||
+        status === 'disconnected' ||
+        initializing.has(sessionId) ||
+        (!current &&
+          !!(await prisma.whatsAppSession
+            .findUnique({ where: { sessionId }, select: { sessionId: true } })
+            .catch(() => null)));
+
+      if (restoring) {
+        const state = status ?? (initializing.has(sessionId) ? 'restoring' : 'disconnected');
+        log.warn({ to, state }, 'session still restoring after wait — returning SESSION_UNHEALTHY (retry)');
+        return {
+          success: false,
+          messageId: null,
+          recipientPhone: to,
+          error: 'Session is restoring — retry shortly.',
+          sessionUnhealthy: { state, retryAfter: 10 },
+          timestamp: new Date().toISOString(),
+        };
+      }
+
+      // qr_pending or no saved blob — genuinely needs a fresh link / QR scan.
+      return {
+        success: false,
+        messageId: null,
+        recipientPhone: to,
+        error: current ? `Session not ready (${current.status})` : 'No active session — link WhatsApp first.',
+        timestamp: new Date().toISOString(),
+      };
+    }
   }
 
   // Liveness check — the in-memory `ready` status can lie when the WA Web
@@ -810,6 +1093,22 @@ export async function sendMessage(
   // same path so coverage is automatic across single + bulk sends.
   // Override (operator opt-in) skips every gate below.
   if (!override) {
+    // Min inter-send spacing — randomised gap between consecutive sends on
+    // this account (anti-burst). The bulk loop waits this out before calling
+    // us (accountSpacingWaitMs), so this gate only ever trips for single
+    // sends arriving too fast; they get a retryAfter to pace by.
+    const spacing = checkAccountSpacing(sessionId);
+    if (!spacing.ok) {
+      log.warn({ to, code: spacing.code, retryAfter: spacing.retryAfter }, 'account spacing — skipping send');
+      return {
+        success: false,
+        messageId: null,
+        recipientPhone: to,
+        error: spacing.message,
+        rateLimit: { code: spacing.code, retryAfter: spacing.retryAfter },
+        timestamp: new Date().toISOString(),
+      };
+    }
     const cooldown = checkRecipientCooldown(to);
     if (!cooldown.ok) {
       log.warn({ to, retryAfter: cooldown.retryAfter }, 'recipient cooldown — skipping send');
@@ -904,6 +1203,10 @@ export async function sendMessage(
     const timestamp = new Date().toISOString();
     managed.lastActivity = timestamp;
     recordRecipientSend(to);
+    // Arm the next-allowed-send timestamp for this account (warmup-aware,
+    // randomised). Recorded even on override sends so subsequent gated sends
+    // still pace off the most recent activity.
+    await recordAccountSend(sessionId);
     return { success: true, messageId: msg.id?.id ?? null, recipientPhone: to, timestamp };
   } catch (err) {
     log.error({ err, stage, to, chatId }, 'sendMessage failed');

@@ -29,7 +29,8 @@ export type LimitCode =
   | 'RECIPIENT_COOLDOWN'
   | 'ACCOUNT_RATE_LIMIT'
   | 'WARMUP_LIMIT'
-  | 'GLOBAL_RATE_LIMIT';
+  | 'GLOBAL_RATE_LIMIT'
+  | 'ACCOUNT_SPACING';
 
 export interface LimitCheckOk { ok: true }
 export interface LimitCheckFail { ok: false; code: LimitCode; retryAfter: number; message: string }
@@ -185,6 +186,65 @@ export async function consumeRateTokens(sessionId: string): Promise<LimitCheck> 
   return { ok: true };
 }
 
+// ---------------------------------------------------------------------------
+// 4. Per-account min inter-send spacing
+// ---------------------------------------------------------------------------
+//
+// The token bucket caps *rate* but allows bursts — 30 tokens can fire in a
+// few seconds, which reads as automation to WhatsApp's spam scorer (fixed or
+// sub-second intervals are a known ban trigger). This gate enforces a
+// randomised minimum gap between consecutive sends on the SAME account:
+// 15–45s once mature, 30–60s during warmup. Randomised so the cadence isn't
+// a tell. Single sends that arrive too soon get rejected with retryAfter (the
+// caller paces); the bulk loop instead WAITS out the gap (see
+// accountSpacingWaitMs) so it never generates spacing failures.
+
+const SPACING_MIN_MS = Number(process.env.SEND_SPACING_MIN_MS) || 15_000;
+const SPACING_MAX_MS = Number(process.env.SEND_SPACING_MAX_MS) || 45_000;
+const SPACING_WARMUP_MIN_MS = Number(process.env.SEND_SPACING_WARMUP_MIN_MS) || 30_000;
+const SPACING_WARMUP_MAX_MS = Number(process.env.SEND_SPACING_WARMUP_MAX_MS) || 60_000;
+
+// Earliest ms-timestamp at which the next send on a given account is allowed.
+const accountNextSend = new Map<string, number>();
+
+/** ms the caller must wait before the next send on this account (0 if clear). */
+export function accountSpacingWaitMs(sessionId: string): number {
+  const next = accountNextSend.get(sessionId);
+  if (next === undefined) return 0;
+  return Math.max(0, next - Date.now());
+}
+
+/**
+ * Reject-gate form of the spacing check — for the single-send path, where
+ * blocking the HTTP request for up to a minute is undesirable. Returns a
+ * retryAfter so the caller can pace.
+ */
+export function checkAccountSpacing(sessionId: string): LimitCheck {
+  const wait = accountSpacingWaitMs(sessionId);
+  if (wait <= 0) return { ok: true };
+  const retryAfter = Math.ceil(wait / 1000);
+  return {
+    ok: false,
+    code: 'ACCOUNT_SPACING',
+    retryAfter,
+    message: `Minimum spacing between sends on this account — retry in ~${retryAfter}s`,
+  };
+}
+
+/**
+ * Record a send and arm the next-allowed timestamp with a fresh randomised
+ * gap (warmup-aware). Call on every successful send. `isWarmup` is resolved
+ * from the (cached) linkedAt so callers don't have to thread it through.
+ */
+export async function recordAccountSend(sessionId: string): Promise<void> {
+  const { isWarmup } = await getAccountCapacity(sessionId);
+  const [min, max] = isWarmup
+    ? [SPACING_WARMUP_MIN_MS, SPACING_WARMUP_MAX_MS]
+    : [SPACING_MIN_MS, SPACING_MAX_MS];
+  const gap = min + Math.floor(Math.random() * (max - min + 1));
+  accountNextSend.set(sessionId, Date.now() + gap);
+}
+
 /**
  * Invalidate the cached linkedAt for a session — call on destroySession()
  * so a re-link picks up the new (fresh) linkedAt + restarts the warmup
@@ -193,6 +253,7 @@ export async function consumeRateTokens(sessionId: string): Promise<LimitCheck> 
 export function forgetAccount(sessionId: string): void {
   linkedAtCache.delete(sessionId);
   accountBuckets.delete(sessionId);
+  accountNextSend.delete(sessionId);
 }
 
 // Body-text variation lives in src/lib/body-variation.ts — separated so the

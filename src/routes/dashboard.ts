@@ -736,6 +736,37 @@ function updateSessionFilterOptions() {
   }
 }
 
+// Live delivery/read state per messageId, fed by message.ack events. Kept
+// separate from the feed rows so a filter-rerender can re-show the latest
+// ticks, and so acks for messages no longer on screen aren't lost.
+const messageAcks = new Map();
+
+// WhatsApp-style ticks for a sent row, escalating with the ack level:
+//   1/0/null = sent (✓) · 2 = delivered (✓✓) · 3 = read (✓✓ blue) · -1 = error.
+// "Read" only ever shows if the recipient has read receipts enabled.
+function deliveryTicks(ack) {
+  if (ack === -1) return '<span title="Delivery error">⚠ error</span>';
+  if (ack >= 3)   return '<span title="Read (recipient opened it)" style="color:#38bdf8">✓✓ read</span>';
+  if (ack === 2)  return '<span title="Delivered to recipient device" style="color:#9ca3af">✓✓ delivered</span>';
+  return '<span title="Sent to WhatsApp server" style="color:#6b7280">✓ sent</span>';
+}
+
+// Apply a message.ack event: bump the per-message state (acks are monotonic;
+// ignore stale/out-of-order lower values) and update the on-screen row in
+// place. Does NOT add a feed row — acks would be far too noisy (up to 3 per
+// message).
+function applyAck(ev) {
+  const d = ev.data || {};
+  const mid = d.messageId;
+  if (!mid || typeof d.ack !== 'number') return;
+  const prev = messageAcks.get(mid);
+  if (prev !== undefined && prev >= d.ack) return;
+  messageAcks.set(mid, d.ack);
+  for (const el of $('messages').querySelectorAll('.delivery-status')) {
+    if (el.dataset.ackFor === mid) el.innerHTML = deliveryTicks(d.ack);
+  }
+}
+
 function renderMessageRow(ev) {
   const row = document.createElement('div');
   row.className = 'row msg-row hairline border-b transition-colors' + (ev.replay ? ' replay' : '');
@@ -769,6 +800,16 @@ function renderMessageRow(ev) {
     ? '<span class="ml-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider bg-rose-500/20 border border-rose-500/40 text-rose-300" title="Sent with X-Worker-Override — anti-ban gates bypassed">⚠ Override</span>'
     : '';
 
+  // Delivery/read ticks — only on sent rows, updated live in place by
+  // applyAck() as message.ack events arrive. Seeded from any ack already
+  // known (covers filter-rerenders and SSE backfill where the ack replayed
+  // before this row was re-created).
+  const deliverySpan = (isSent && d.messageId)
+    ? '<span class="delivery-status ml-2 text-[10px] normal-case tracking-normal font-medium" data-ack-for="' + d.messageId + '">'
+        + deliveryTicks(messageAcks.has(d.messageId) ? messageAcks.get(d.messageId) : null)
+      + '</span>'
+    : '';
+
   // Headline content (recipient phone for sends, summary for bulk). Always
   // rendered on its OWN line below the status/time row, so on mobile a long
   // phone number can't get clipped by the timestamp competing for width.
@@ -789,6 +830,9 @@ function renderMessageRow(ev) {
   if (d.batchId)               chips.push('<span class="meta-chip text-amber-300/90 hover:text-amber-300" data-copy="' + d.batchId + '" title="' + d.batchId + ' — click to copy">batch ' + shortId(d.batchId) + '</span>');
   if (isSent && d.messageId)   chips.push('<span class="meta-chip text-neutral-400 hover:text-neutral-200" data-copy="' + d.messageId + '" title="' + d.messageId + ' — click to copy">msg ' + shortId(d.messageId, 12) + '</span>');
   if (isFailed && d.reason)    chips.push('<span class="text-rose-300/80 text-[11px]">' + d.reason + '</span>');
+  // Bulk rows expand to a per-recipient delivery/read breakdown, fetched from
+  // GET /v1/messages/send-bulk/:batchId (acks merged in live server-side).
+  if ((isBulkS || isBulkC) && d.batchId) chips.push('<button class="batch-detail-chip" data-batch="' + d.batchId + '" title="Show per-recipient delivery / read status">▸ recipients</button>');
 
   // Resend chip — only renders when we have enough data (sessionId + recipient
   // + body). Clicking triggers a fresh POST /v1/messages/send with
@@ -823,12 +867,13 @@ function renderMessageRow(ev) {
     '  <div class="bubble ' + bubbleCls + '">' + bubbleIcon + '</div>' +
     '  <div class="flex-1 min-w-0">' +
     '    <div class="msg-row-meta">' +
-    '      <div class="text-xs font-semibold uppercase tracking-wide flex items-center">' + statusLabel + overrideBadge + '</div>' +
+    '      <div class="text-xs font-semibold uppercase tracking-wide flex items-center">' + statusLabel + overrideBadge + deliverySpan + '</div>' +
     '      <div class="text-[11px] text-neutral-500 num shrink-0">' + timeStr(ev.ts) + '</div>' +
     '    </div>' +
     (headlineInner ? '<div class="msg-row-headline">' + headlineInner + '</div>' : '') +
     bodyBlock +
     (chips.length ? '<div class="msg-row-chips">' + chips.join('') + '</div>' : '') +
+    (((isBulkS || isBulkC) && d.batchId) ? '<div class="batch-detail" data-batch="' + d.batchId + '" style="display:none"></div>' : '') +
     '  </div>' +
     '</div>';
 
@@ -857,7 +902,99 @@ function renderMessageRow(ev) {
     el.addEventListener('mouseleave', () => { if (!el.disabled) el.style.background = 'rgba(245,158,11,0.10)'; });
     el.addEventListener('click', () => doResend(el));
   }
+  // Bulk "recipients" toggle — sky tint, neutral chip styling.
+  for (const el of row.querySelectorAll('.batch-detail-chip')) {
+    el.style.cursor = 'pointer';
+    el.style.background = 'rgba(56,189,248,0.10)';
+    el.style.border = '1px solid rgba(56,189,248,0.28)';
+    el.style.color = '#7dd3fc';
+    el.style.padding = '2px 8px';
+    el.style.borderRadius = '999px';
+    el.style.fontWeight = '500';
+    el.style.transition = 'background 0.15s ease';
+    el.addEventListener('mouseenter', () => { el.style.background = 'rgba(56,189,248,0.20)'; });
+    el.addEventListener('mouseleave', () => { el.style.background = 'rgba(56,189,248,0.10)'; });
+    el.addEventListener('click', () => toggleBatchDetail(el));
+  }
   return row;
+}
+
+// ---------- bulk per-recipient detail ----------
+
+// Toggle the per-recipient panel under a bulk row, lazy-loading on first open.
+async function toggleBatchDetail(btn) {
+  const batchId = btn.dataset.batch;
+  const row = btn.closest('.msg-row');
+  const panel = row && row.querySelector('.batch-detail');
+  if (!panel) return;
+  if (panel.style.display !== 'none') {
+    panel.style.display = 'none';
+    btn.textContent = '▸ recipients';
+    return;
+  }
+  panel.style.display = 'block';
+  btn.textContent = '▾ recipients';
+  await loadBatchDetail(batchId, panel);
+}
+
+async function loadBatchDetail(batchId, panel) {
+  panel.innerHTML = '<div class="text-[11px] text-neutral-500 py-2 px-1">Loading recipients…</div>';
+  try {
+    const r = await fetch('/v1/messages/send-bulk/' + encodeURIComponent(batchId), {
+      headers: { 'X-Worker-Secret': secret, 'X-Dashboard-Internal': '1' },
+    });
+    if (!r.ok) {
+      panel.innerHTML = '<div class="text-[11px] text-rose-300 py-2 px-1">Failed to load batch (HTTP ' + r.status + ')</div>';
+      return;
+    }
+    renderBatchDetail(await r.json(), panel);
+  } catch (e) {
+    panel.innerHTML = '<div class="text-[11px] text-rose-300 py-2 px-1">Error: ' + esc(e && e.message ? e.message : String(e)) + '</div>';
+  }
+}
+
+function renderBatchDetail(batch, panel) {
+  const results = Array.isArray(batch.results) ? batch.results : [];
+  let delivered = 0, read = 0, failed = 0;
+  for (const x of results) {
+    if (!x.success) { failed++; continue; }
+    if (x.delivered) delivered++;
+    if (x.read) read++;
+  }
+
+  const summary = results.length + ' recipient' + (results.length === 1 ? '' : 's')
+    + ' · <span style="color:#9ca3af">' + delivered + ' delivered</span>'
+    + ' · <span style="color:#38bdf8">' + read + ' read</span>'
+    + (failed ? ' · <span class="text-rose-300">' + failed + ' failed</span>' : '');
+
+  let rows = '';
+  for (const x of results) {
+    const status = x.success
+      ? deliveryTicks(typeof x.ack === 'number' ? x.ack : null)
+      : '<span title="Send failed" style="color:#f87171">✗ failed</span>';
+    const err = (!x.success && x.error) ? ' <span class="text-rose-300/70">' + esc(String(x.error)) + '</span>' : '';
+    rows += '<div class="flex items-center justify-between gap-3 py-1 border-t border-white/5">'
+      + '<span class="mono text-neutral-200 text-[12px] truncate">' + maskPhone(x.recipient) + '</span>'
+      + '<span class="text-[11px] shrink-0">' + status + err + '</span>'
+      + '</div>';
+  }
+
+  panel.innerHTML =
+    '<div class="mt-2 rounded-lg" style="background:rgba(0,0,0,0.22);padding:6px 12px 8px">'
+    + '<div class="flex items-center justify-between gap-3 py-1.5">'
+    +   '<span class="text-[11px] text-neutral-400">' + summary + '</span>'
+    +   '<button class="batch-refresh text-[11px]" data-batch="' + batch.batchId + '" title="Re-fetch — acks land seconds-to-hours after sending" style="cursor:pointer;color:#7dd3fc">↻ refresh</button>'
+    + '</div>'
+    + (rows || '<div class="text-[11px] text-neutral-500 py-1">No results yet.</div>')
+    + '</div>';
+
+  const rb = panel.querySelector('.batch-refresh');
+  if (rb) rb.addEventListener('click', () => loadBatchDetail(batch.batchId, panel));
+}
+
+// Minimal HTML escaper for values interpolated into the detail panel.
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
 // Resend handler — re-POSTs to /v1/messages/send with X-Worker-Override.
@@ -1195,6 +1332,8 @@ function handleEvent(ev) {
     if (appendMessage(ev)) { counters.sent++; if (!ev.replay) recentSendTimestamps.push(Date.now()); }
   } else if (ev.type === 'message.failed') {
     if (appendMessage(ev)) counters.failed++;
+  } else if (ev.type === 'message.ack') {
+    applyAck(ev);
   } else if (ev.type === 'bulk.started' || ev.type === 'bulk.completed') {
     appendMessage(ev);
   } else if (ev.type === 'http.request') {

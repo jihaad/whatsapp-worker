@@ -22,7 +22,7 @@ Versioned API surface lives under `/v1`. Operator dashboard (Messages / Network 
 1. **Never run two workers against the same Supabase project.** Both restore from the same `whatsapp_sessions.sessionData` blobs at boot → both claim to be the same WhatsApp Web device → WA's server bumps one offline → silent message loss (sends look "successful" with valid messageIds but never deliver). This is the #1 cause of "shows sent but didn't arrive" bugs. Check with `pgrep -fa "tsx watch src/index.ts"` and `lsof -i:3001` on the dev machine.
 2. **`client.sendMessage()` returning a messageId proves nothing about delivery.** whatsapp-web.js generates the id client-side before any server ack. The real signal is the message's `ack` field (-1 error, 0 pending, 1 server-received, 2 device-received, 3 read). The worker doesn't currently wait for ack ≥ 1 — that's a known gap; see TODO.
 3. **`client.getState()` only reads the SPA's state machine, not the wire.** A wedged session can still report `CONNECTED`. Use this knowledge before "fixing" the watchdog or liveness probe — they look correct but don't catch protocol-level drift.
-4. **Reinit is hard-capped at 1 attempt per 15 min per session.** WhatsApp ratelimits re-link attempts; passive auto-reconnect loops are how the linked phone gets banned. The watchdog is **detect-only** by design; only the send path triggers reinit, with a cooldown. Don't relax this.
+4. **Reinit is hard-capped at 1 attempt per 15 min per session.** WhatsApp ratelimits re-link attempts; uncapped auto-reconnect loops are how the linked phone gets banned. Every in-memory reinit goes through `reinitializeSessionDebounced` (the 15-min cap). The watchdog **does drive recovery** (May 2026): each 5-min sweep reinits `disconnected` + stuck-`connecting` sessions and reconciles against the DB to re-init any saved session missing from memory — so a restart needs no manual intervention even if the boot-time `restoreSessions()` failed. The cap is what keeps this ban-safe; the DB-reconcile re-init resumes a *valid saved blob* (not a fresh QR pairing), and any blob WhatsApp rejects has its DB row deleted on the restore-rejected path so it never loops re-auth. Don't remove the cap or the row-delete-on-reject.
 5. **The `whatsapp_sessions.sessionId` column** was renamed from `schoolId` in May 2026. If you see `schoolId` anywhere in code, it's a regression — old name, dead reference. (FD's mirror schema was updated in lockstep.)
 6. **Anti-ban gates can be bypassed with `X-Worker-Override: 1`** (or `{ "override": true }` in body). Use sparingly — logs at warn level, surfaces with ⚠ OVERRIDE pill in the dashboard. Real ban risk if abused.
 
@@ -46,7 +46,8 @@ src/
     body-variation.ts    per-send trailing-whitespace variation
     bulk-batch-maintenance.ts  boot sweep + 24h eviction
     event-persistence.ts subscribes eventBus → whatsapp_message_events
-    session-watchdog.ts  detect-only 5-min sweep
+    session-watchdog.ts  5-min recovery sweep (liveness + reinit + DB reconcile)
+    operator-alerts.ts   ntfy push when a session needs attention (auth_failure, restore_rejected, connect_timeout, stuck_connecting)
     override.ts          X-Worker-Override header / body field check
   middleware/
     auth.ts          X-Worker-Secret check (timing-safe)

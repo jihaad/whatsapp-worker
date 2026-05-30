@@ -23,6 +23,7 @@ const log = logger.child({ component: 'event-persistence' });
 const PERSISTED_TYPES = new Set([
   'message.sent',
   'message.failed',
+  'message.ack',
   'bulk.started',
   'bulk.completed',
 ]);
@@ -45,6 +46,7 @@ function persist(event: WorkerEvent): void {
         recipient: typeof d.recipient === 'string' ? d.recipient : null,
         messageId: typeof d.messageId === 'string' ? d.messageId : null,
         batchId:   typeof d.batchId   === 'string' ? d.batchId   : null,
+        ack:       typeof d.ack       === 'number' ? d.ack       : null,
         error:
           typeof d.reason === 'string' ? d.reason :
           typeof d.error === 'string'  ? d.error  : null,

@@ -22,6 +22,7 @@ export type ErrorCode =
   | 'ACCOUNT_RATE_LIMIT'
   | 'WARMUP_LIMIT'
   | 'GLOBAL_RATE_LIMIT'
+  | 'ACCOUNT_SPACING'
   // Session's underlying WhatsApp Web socket is dead. Distinct from a
   // genuine "phone not on WhatsApp" lookup miss — the right caller
   // response is "retry later", not "the number is wrong".

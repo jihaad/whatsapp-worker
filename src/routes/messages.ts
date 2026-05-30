@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
 import { sendMessage, checkLive, reinitializeSessionDebounced } from '../sessions';
-import { isQuietHour, sleepJitter, getQuietHoursMessage } from '../anti-ban';
+import { isQuietHour, sleepJitter, nextMessageDelayMs, getQuietHoursMessage } from '../anti-ban';
+import { accountSpacingWaitMs } from '../lib/messaging-limits';
 import { quietHoursGuard } from '../middleware/quiet-hours';
 import { messagesSent, messagesFailed, bulkBatchesStarted } from '../metrics';
 import { SendMessageBodySchema, SendBulkBodySchema } from '../openapi';
@@ -12,6 +13,7 @@ import { sendLimiter } from '../lib/rate-limit';
 import { prisma } from '../prisma';
 import { eventBus } from '../events';
 import { hasOverride } from '../lib/override';
+import { ackLabel } from '../lib/ack';
 
 const router = Router();
 
@@ -148,11 +150,13 @@ router.post('/send-bulk', quietHoursGuard, sendLimiter, idempotency, async (req,
     return;
   }
 
-  bulkBatchesStarted.inc();
-  eventBus.publish('bulk.started', { sessionId, total: messages.length, override });
-
+  // Generate the batchId before announcing the batch so the dashboard can
+  // expand a still-processing batch (the bulk.started row carries it too).
   const batchId = crypto.randomUUID();
   const batchLog = logger.child({ batchId, sessionId });
+
+  bulkBatchesStarted.inc();
+  eventBus.publish('bulk.started', { sessionId, batchId, total: messages.length, override });
 
   try {
     await prisma.whatsAppBulkBatch.create({
@@ -189,9 +193,18 @@ router.post('/send-bulk', quietHoursGuard, sendLimiter, idempotency, async (req,
     for (let i = 0; i < messages.length; i++) {
       const { recipient, body } = messages[i]!;
 
-      // Anti-ban gates only apply when override isn't set: jitter, plus the
-      // mid-batch quiet-hours check that would otherwise pause delivery.
-      if (i > 0 && !override) await sleepJitter();
+      // Anti-ban pacing (skipped under override): wait out the per-account
+      // min inter-send spacing (randomised 15–45s mature / 30–60s warming).
+      // This subsumes the old fixed jitter and means sendMessage's
+      // ACCOUNT_SPACING gate never trips mid-batch. We wait the account's
+      // OUTSTANDING window even for the first message (i === 0) — a batch can
+      // start right after other activity already armed it, and skipping the
+      // wait there would make message 0 fail the gate. Between messages
+      // (i > 0) we also enforce a jitter floor so the cadence has variance.
+      if (!override) {
+        const wait = Math.max(accountSpacingWaitMs(sessionId), i > 0 ? nextMessageDelayMs() : 0);
+        if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      }
 
       if (!override && isQuietHour()) {
         for (let j = i; j < messages.length; j++) {
@@ -260,6 +273,37 @@ router.get('/send-bulk/:batchId', async (req, res) => {
       sendError(req, res, 404, 'NOT_FOUND', 'Batch not found');
       return;
     }
+
+    // Merge live delivery/read acks into each result by messageId. Acks are
+    // tracked uniformly for bulk-sent messages (the message_ack handler in
+    // sessions.ts), so this surfaces per-recipient delivered/read state in the
+    // batch poll — read at query time, so the append-only results JSONB is
+    // never mutated (no write race with the send loop).
+    const results = (batch.results as unknown as BulkMessageResult[]) ?? [];
+    const ids = results.map((r) => r.messageId).filter((x): x is string => !!x);
+    const ackMap = new Map<string, number>();
+    if (ids.length > 0) {
+      const ackRows = await prisma.whatsAppMessageEvent.findMany({
+        where: { messageId: { in: ids }, ack: { not: null } },
+        select: { messageId: true, ack: true },
+      });
+      for (const r of ackRows) {
+        if (!r.messageId || r.ack == null) continue;
+        // Acks can arrive out of order on reconnect — keep the highest.
+        ackMap.set(r.messageId, Math.max(ackMap.get(r.messageId) ?? -2, r.ack));
+      }
+    }
+    const enriched = results.map((r) => {
+      const ack = r.messageId ? ackMap.get(r.messageId) ?? null : null;
+      return {
+        ...r,
+        ack,
+        deliveryStatus: r.success ? ackLabel(ack) : null,
+        delivered: ack != null && ack >= 2,
+        read: ack != null && ack >= 3,
+      };
+    });
+
     res.json({
       batchId: batch.batchId,
       sessionId: batch.sessionId,
@@ -267,13 +311,62 @@ router.get('/send-bulk/:batchId', async (req, res) => {
       total: batch.total,
       succeeded: batch.succeeded,
       failed: batch.failed,
-      results: batch.results,
+      results: enriched,
       startedAt: batch.startedAt.toISOString(),
       completedAt: batch.completedAt?.toISOString() ?? undefined,
     });
   } catch (err) {
     req.log.error({ err, batchId: req.params.batchId }, 'GET /messages/send-bulk/:batchId failed');
     sendError(req, res, 500, 'INTERNAL', 'Failed to read batch');
+  }
+});
+
+// Delivery/read status for a single sent message. Acks arrive asynchronously
+// (the recipient's device confirms seconds-to-hours later), so this is a poll:
+// callers hit it after a send to learn whether the message was delivered
+// (ack ≥ 2) or read (ack 3). Works for single and bulk sends alike. SSE
+// subscribers (GET /events) also receive the same transitions live as
+// `message.ack` events.
+//
+// Registered after the literal /send-bulk routes; the two-segment shapes
+// (`send-bulk/:batchId` vs `:messageId/status`) don't overlap.
+router.get('/:messageId/status', async (req, res) => {
+  const { messageId } = req.params;
+  try {
+    const rows = await prisma.whatsAppMessageEvent.findMany({
+      where: { messageId },
+      orderBy: { ts: 'asc' },
+      select: { type: true, ts: true, sessionId: true, recipient: true, ack: true, error: true },
+    });
+    if (rows.length === 0) {
+      sendError(req, res, 404, 'NOT_FOUND', 'Unknown messageId (never sent, or evicted after 7-day retention)');
+      return;
+    }
+
+    const sent = rows.find((r) => r.type === 'message.sent');
+    const failed = rows.find((r) => r.type === 'message.failed');
+    // Highest ack seen wins (out-of-order delivery on reconnect is possible).
+    const ack = rows.reduce<number | null>(
+      (max, r) => (r.ack != null && (max == null || r.ack > max) ? r.ack : max),
+      null,
+    );
+    const last = rows[rows.length - 1]!;
+
+    res.json({
+      messageId,
+      sessionId: sent?.sessionId ?? rows[0]!.sessionId ?? null,
+      recipient: sent?.recipient ?? rows[0]!.recipient ?? null,
+      ack, // numeric -1..4, or null if no ack observed yet
+      status: failed && !sent ? 'failed' : ackLabel(ack),
+      delivered: ack != null && ack >= 2,
+      read: ack != null && ack >= 3,
+      sentAt: sent?.ts.toISOString() ?? null,
+      lastUpdateAt: last.ts.toISOString(),
+      error: failed?.error ?? null,
+    });
+  } catch (err) {
+    req.log.error({ err, messageId }, 'GET /messages/:messageId/status failed');
+    sendError(req, res, 500, 'INTERNAL', 'Failed to read message status');
   }
 });
 

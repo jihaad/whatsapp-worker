@@ -90,9 +90,12 @@ model WhatsAppMessageEvent {
   messageId String?
   batchId   String?  @db.Uuid
   error     String?
+  /// Delivery/read ack level for `message.ack` rows (-1..4); null for others.
+  ack       Int?
   data      Json     @default("{}")
 
   @@index([ts(sort: Desc)])
   @@index([sessionId])
+  @@index([messageId])
   @@map("whatsapp_message_events")
 }

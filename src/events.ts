@@ -24,6 +24,11 @@ export type WorkerEventType =
   | 'session.deleted'
   | 'message.sent'
   | 'message.failed'
+  // Outbound delivery/read receipt — fired by whatsapp-web.js's message_ack
+  // for our own (fromMe) messages as the recipient's device confirms. Carries
+  // { sessionId, recipient, messageId, ack, ackLabel }. Persisted so callers
+  // can poll GET /v1/messages/:messageId/status.
+  | 'message.ack'
   | 'bulk.started'
   | 'bulk.completed'
   // HTTP request trace — captured by src/middleware/request-trace.ts and

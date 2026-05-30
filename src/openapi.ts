@@ -29,6 +29,12 @@ export const SendMessageResultSchema = registry.register('SendMessageResult', z.
   timestamp:      z.string().openapi({ description: 'Worker-side ISO 8601 timestamp at the moment the WhatsApp sendMessage call returned' }),
 }));
 
+// ack 0..4 / null → human status. Shared by the single-message status
+// endpoint and the per-result delivery state in a bulk batch poll.
+const AckStatusEnum = z.enum(['pending', 'sent', 'delivered', 'read', 'played', 'error', 'failed', 'unknown']).openapi({
+  description: 'Delivery state derived from the WhatsApp ack level: pending (handed to client, no server ack) · sent (server received, ✓) · delivered (recipient device, ✓✓) · read (✓✓ blue — only if the recipient has read receipts on) · played (voice) · error · failed (send itself failed).',
+});
+
 export const BulkMessageResultSchema = registry.register('BulkMessageResult', z.object({
   index:     z.number().int(),
   recipient: z.string(),
@@ -36,6 +42,25 @@ export const BulkMessageResultSchema = registry.register('BulkMessageResult', z.
   messageId: z.string().nullable(),
   error:     z.string().optional(),
   timestamp: z.string(),
+  // Live delivery/read state merged in at poll time (null until the first ack
+  // arrives, or for failed sends).
+  ack:            z.number().int().nullable().openapi({ description: 'Raw WhatsApp ack level (-1..4), or null if no ack observed yet' }),
+  deliveryStatus: AckStatusEnum.nullable().openapi({ description: 'Human delivery status for this message; null for failed sends' }),
+  delivered:      z.boolean().openapi({ description: 'True once ack ≥ 2 (reached recipient device)' }),
+  read:           z.boolean().openapi({ description: 'True once ack = 3 (read — recipient must have read receipts enabled)' }),
+}));
+
+export const MessageStatusSchema = registry.register('MessageStatus', z.object({
+  messageId:    z.string(),
+  sessionId:    z.string().nullable(),
+  recipient:    z.string().nullable(),
+  ack:          z.number().int().nullable().openapi({ description: 'Raw WhatsApp ack level (-1 error, 0 pending, 1 sent, 2 delivered, 3 read, 4 played), or null if none observed yet' }),
+  status:       AckStatusEnum,
+  delivered:    z.boolean().openapi({ description: 'True once ack ≥ 2' }),
+  read:         z.boolean().openapi({ description: 'True once ack = 3 (recipient must have read receipts enabled)' }),
+  sentAt:       z.string().nullable().openapi({ description: 'ISO 8601 — when the worker handed the message to WhatsApp' }),
+  lastUpdateAt: z.string().openapi({ description: 'ISO 8601 — timestamp of the most recent event for this message' }),
+  error:        z.string().nullable().openapi({ description: 'Failure reason when status is "failed"' }),
 }));
 
 export const BulkBatchSchema = registry.register('BulkBatch', z.object({
@@ -94,7 +119,7 @@ const rateLimitedResponse = errorResponse(
 // of the messaging-layer anti-ban guards inside sendMessage(). One status
 // code, several distinct `error.code` values.
 const sendRateLimitedResponse = errorResponse(
-  'Rate limit exceeded. `error.code` is one of: `RATE_LIMITED` (HTTP per-IP cap — 30/min on send endpoints), `RECIPIENT_COOLDOWN` (same number sent within 5 min), `ACCOUNT_RATE_LIMIT` (30 msg/min per linked account), `WARMUP_LIMIT` (first 7 days have a lower cap, ramping from 5 → 30 msg/min), `GLOBAL_RATE_LIMIT` (100 msg/min across all accounts). `Retry-After` header + `error.retryAfter` give the wait in seconds.',
+  'Rate limit exceeded. `error.code` is one of: `RATE_LIMITED` (HTTP per-IP cap — 30/min on send endpoints), `RECIPIENT_COOLDOWN` (same number sent within 5 min), `ACCOUNT_RATE_LIMIT` (30 msg/min per linked account), `WARMUP_LIMIT` (first 7 days have a lower cap, ramping from 5 → 30 msg/min), `GLOBAL_RATE_LIMIT` (100 msg/min across all accounts), `ACCOUNT_SPACING` (minimum randomised gap between consecutive sends on the same account — 15–45s mature / 30–60s warming; single sends arriving sooner are rejected so the caller paces, while bulk batches wait it out internally). `Retry-After` header + `error.retryAfter` give the wait in seconds.',
 );
 
 // ---------------------------------------------------------------------------
@@ -258,13 +283,27 @@ registry.registerPath({
 registry.registerPath({
   method: 'get', path: '/v1/messages/send-bulk/{batchId}',
   summary: 'Poll bulk send progress',
-  description: 'Returns current batch state. Poll until status is "complete". Batches are held for 24 hours after completion.',
+  description: 'Returns current batch state with per-message delivery/read state (`ack`, `deliveryStatus`, `delivered`, `read`) merged in live. Poll until status is "complete"; keep polling afterwards if you want delivered/read to settle (acks land seconds-to-hours later). Batches are held for 24 hours after completion.',
   request: { params: z.object({ batchId: z.string().uuid() }) },
   responses: {
     200: { description: 'Batch state', content: { 'application/json': { schema: BulkBatchSchema } } },
     401: errorResponse('Missing or invalid X-Worker-Secret'),
     404: errorResponse('Batch not found'),
     429: rateLimitedResponse,
+  },
+});
+
+registry.registerPath({
+  method: 'get', path: '/v1/messages/{messageId}/status',
+  summary: 'Poll a message\'s delivery / read status',
+  description: 'Returns the current delivery state of a previously sent message (single or bulk), derived from WhatsApp acks. Acks are asynchronous — expect `pending`/`sent` immediately after a send, with `delivered` (ack ≥ 2) and `read` (ack 3) landing later as the recipient\'s device confirms. `read` only ever appears if the recipient has read receipts (blue ticks) enabled. The same transitions are also pushed live over GET /events as `message.ack`. Subject to 7-day event retention.',
+  request: { params: z.object({ messageId: z.string().openapi({ description: 'The messageId returned by a prior send' }) }) },
+  responses: {
+    200: { description: 'Message status', content: { 'application/json': { schema: MessageStatusSchema } } },
+    401: errorResponse('Missing or invalid X-Worker-Secret'),
+    404: errorResponse('Unknown messageId — never sent, or evicted after 7-day retention'),
+    429: rateLimitedResponse,
+    500: errorResponse('Internal error'),
   },
 });
 
